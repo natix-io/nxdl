@@ -1,0 +1,83 @@
+syntax = "proto3";
+
+package metadata;
+
+// Top-level metadata structure version
+message Metadata {
+    uint32 version = 1;
+    GPSMetadata gps = 2;
+    ImageMetadata image = 3;
+    ContextMetadata context = 4;
+    CalibrationMetadata calibration = 5;
+}
+
+// GPS Metadata
+message GPSMetadata {
+    string latitude_ref = 1;
+    string longitude_ref = 2;
+}
+
+// Lens and Image Info
+message ImageMetadata {
+    int32 image_width = 3;
+    int32 image_height = 4;
+    string megapixels = 5;
+}
+
+// Contextual Data
+message ContextMetadata {
+    string footage_filename = 1;
+    string trip_identifier = 2;
+    string vehicle_make = 3;
+    string vehicle_model = 4;
+    string phone_make = 5;
+    string phone_model = 6;
+    string platform_type_video = 7;
+    string platform_type_data = 8;
+    string platform_type_gps = 9;
+    string reference_frame = 10;
+    
+}
+
+// Camera Intrinsic Parameters
+message Intrinsics {
+    optional float fx = 1;
+    optional float cx = 2;
+    optional float fy = 3;
+    optional float cy = 4;
+    optional float k1 = 5;
+    optional float k2 = 6;
+    optional float k3 = 7;
+    optional float p1 = 8;
+    optional float p2 = 9;
+}
+
+// Extrinsic Parameters
+message Extrinsics {
+    optional float r11 = 1;
+    optional float r12 = 2;
+    optional float r13 = 3;
+    optional float tx = 4;
+    optional float r21 = 5;
+    optional float r22 = 6;
+    optional float r23 = 7;
+    optional float ty = 8;
+    optional float r31 = 9;
+    optional float r32 = 10;
+    optional float r33 = 11;
+    optional float tz = 12;
+    optional int32 field_of_view_hor_deg = 13;
+    optional int32 field_of_view_ver_deg = 14;
+}
+
+// Individual Device Data
+message DeviceCalibration {
+    string device_name = 1;
+    Extrinsics extrinsics = 2;
+    optional Intrinsics intrinsics = 3;
+}
+
+// Full Calibration Data
+message CalibrationMetadata {
+    repeated DeviceCalibration devices = 1;
+}

@@ -1,0 +1,43 @@
+syntax = "proto3";
+
+// --- MCAP Wrapper for Multiple Frames ---
+message TelemetryData {
+  uint32 version = 1;
+  repeated TelemetryFrame frames = 2;
+}
+
+// --- Full Telemetry Data (Per Frame) ---
+message TelemetryFrame {
+  uint64 timestamp_ms = 1;
+  uint64 frame_number = 2;
+  optional Gnss gnss = 3;
+  optional Imu imu = 4;
+}
+
+
+// --- GNSS Data ---
+message Gnss {
+  optional double latitude_deg = 1;
+  optional double longitude_deg = 2;
+  optional float latitude_uncertainty_deg = 4;
+  optional float longitude_uncertainty_deg = 5;
+  optional float heading_deg = 8; 
+}
+
+// --- IMU Data ---
+message Imu {
+  ReferenceFrame reference_frame = 1;
+  optional float x_angular_velocity_rad_per_s = 3;
+  optional float y_angular_velocity_rad_per_s = 4;
+  optional float z_angular_velocity_rad_per_s = 5;
+  optional float x_linear_acceleration_mps2 = 6;
+  optional float y_linear_acceleration_mps2 = 7;
+  optional float z_linear_acceleration_mps2 = 8;
+}
+
+// --- IMU Reference Frame Enum ---
+enum ReferenceFrame {
+  VEHICLE = 0;
+  IMU = 1;
+}
+

@@ -1,0 +1,12 @@
+.venv_natix/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+*.pyo
+dataset/
+cache/
+logs/
+state/
+*.log
+.DS_Store
+Thumbs.db
