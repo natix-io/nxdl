@@ -92,6 +92,7 @@ class Trips(BaseModel):
     perUser: int | None = Field(default=None)
     distance: Range | None = Field(default=None)
     avgSpeed: Range | None = Field(default=None)
+    healthGrade: Range | None = Field(default_factory=lambda: Range(min=500))
     phoneMetadata: PhoneMetadataOptions | None = Field(default=PhoneMetadataOptions.without)
     seiData: SEIDataOptions | None = Field(default=SEIDataOptions.any)
     minutesWithSeiData: Range | None = Field(default=None)

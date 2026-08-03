@@ -1,6 +1,8 @@
 from pathlib import Path
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from schemas.camera_selection import CAMERA_SELECTION
+
 
 class AppSettings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -28,6 +30,12 @@ class AppSettings(BaseSettings):
     cache_dir: Path = Path("./cache")
     output_dir: Path = Path("./dataset")
     dry_mode: bool = False
+
+    # Which cameras to keep out of the ones the server manifest returns for a
+    # minute. 'all' (default) keeps every camera the manifest has; 'front' and
+    # 'front_rear' narrow it. This also relaxes validation's per-grade minimum
+    # camera requirement to the selected subset.
+    camera_selection: CAMERA_SELECTION = CAMERA_SELECTION.ALL
 
     # Optional path to a text file of "<trip_id>_<sub_trip>" lines (one per line,
     # '#' comments allowed). When set, only those trips of the dataset are

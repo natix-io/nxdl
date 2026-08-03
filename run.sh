@@ -29,10 +29,14 @@ Required:
 
 Optional:
   --max-parallel-trips <n>   Number of trips to process concurrently (default: 4)
+  --camera-selection <sel>   Which cameras to keep of the ones the server has:
+                             all (default) | front | front_rear
   --dry-run                  Skip actual downloads; only fetch manifests (default: false)
   -h, --help                 Show this help and exit
 
-Other settings (BASE_URL, timeouts, etc.) are read from .env.production.
+Other settings (BASE_URL, timeouts, CAMERA_SELECTION, etc.) are read from
+.env.production. Pass the same --camera-selection to ./validate.sh, or set
+CAMERA_SELECTION in .env.production so both scripts agree.
 EOF
 }
 
@@ -42,8 +46,9 @@ while [[ $# -gt 0 ]]; do
         --dataset-id=*)          export DATASET_ID="${1#*=}"; shift ;;
         --output-dir=*)          export OUTPUT_DIR="${1#*=}"; shift ;;
         --max-parallel-trips=*)  export MAX_PARALLEL_TRIPS="${1#*=}"; shift ;;
+        --camera-selection=*)    export CAMERA_SELECTION="${1#*=}"; shift ;;
         --dry-run)               export DRY_MODE=true; shift ;;
-        --api-key|--dataset-id|--output-dir|--max-parallel-trips)
+        --api-key|--dataset-id|--output-dir|--max-parallel-trips|--camera-selection)
             if [[ $# -lt 2 ]]; then
                 echo "Error: $1 requires a value." >&2
                 usage >&2
@@ -54,6 +59,7 @@ while [[ $# -gt 0 ]]; do
                 --dataset-id)          export DATASET_ID="$2" ;;
                 --output-dir)          export OUTPUT_DIR="$2" ;;
                 --max-parallel-trips)  export MAX_PARALLEL_TRIPS="$2" ;;
+                --camera-selection)    export CAMERA_SELECTION="$2" ;;
             esac
             shift 2
             ;;

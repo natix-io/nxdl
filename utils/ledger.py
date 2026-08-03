@@ -1,6 +1,6 @@
 """Persisted download/upload state — the resume signal and the progress source.
 
-A single SQLite database at ``output_dir/.download_state.db`` records the status
+A single SQLite database at ``state/<dataset_id>.db`` records the status
 of every trip and file. It is written by exactly ONE thread in the parent
 process (``LedgerWriter``); the multiprocessing workers never touch the DB — they
 only ``put`` :class:`StatusEvent` objects onto a queue via :class:`Reporter`.
@@ -16,6 +16,14 @@ Resume works from two independent signals:
   when the ledger is missing (prod deletes local files after upload): every trip
   is enqueued, each worker finds its files already on S3 and marks the trip
   complete without downloading anything.
+
+A trip is identified by ``(trip_id, sub_trip, health_grade)`` — all three, always.
+One dataset can contain the same ``(trip_id, sub_trip)`` at several health grades
+(a ``healthGrade: {min, max}`` request returns one row per grade, and those grades
+hold genuinely different content), so a pair-only key lets one grade's completion
+mask the others and silently drops them on resume. Grade 500 is the legacy value —
+what the service reports for trips generated before health grades existed — and is
+rendered without a directory suffix.
 """
 
 from __future__ import annotations
@@ -35,12 +43,16 @@ TRIP_COMPLETE = "complete"
 TRIP_PARTIAL = "partial"
 TRIP_FAILED = "failed"
 TRIP_IN_PROGRESS = "in_progress"
-_TRIP_TERMINAL = frozenset({TRIP_COMPLETE})
+
+# Bumped whenever the table shape changes. A DB written by an older version is
+# reset rather than migrated — see `connect`.
+_SCHEMA_VERSION = 2
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS trips (
     trip_id      TEXT NOT NULL,
     sub_trip     INTEGER NOT NULL,
+    health_grade INTEGER NOT NULL,
     status       TEXT NOT NULL,
     country      TEXT,
     state        TEXT,
@@ -51,11 +63,12 @@ CREATE TABLE IF NOT EXISTS trips (
     retry_count  INTEGER DEFAULT 0,
     manifest_generated_at TEXT,
     updated_at   TEXT NOT NULL,
-    PRIMARY KEY (trip_id, sub_trip)
+    PRIMARY KEY (trip_id, sub_trip, health_grade)
 );
 CREATE TABLE IF NOT EXISTS files (
     trip_id     TEXT NOT NULL,
     sub_trip    INTEGER NOT NULL,
+    health_grade INTEGER NOT NULL,
     rel_path    TEXT NOT NULL,
     kind        TEXT,
     status      TEXT NOT NULL,
@@ -63,8 +76,9 @@ CREATE TABLE IF NOT EXISTS files (
     error_stage TEXT,
     error_message TEXT,
     updated_at  TEXT NOT NULL,
-    PRIMARY KEY (trip_id, sub_trip, rel_path)
+    PRIMARY KEY (trip_id, sub_trip, health_grade, rel_path)
 );
+CREATE INDEX IF NOT EXISTS idx_trips_status ON trips(status);
 """
 
 
@@ -75,6 +89,10 @@ class StatusEvent:
     scope: str  # "trip" | "file"
     trip_id: str
     sub_trip: int
+    # Positional and required on purpose: a defaulted grade would let a call site
+    # that forgets it write grade-500 rows for a graded trip — the exact bug the
+    # three-part key exists to prevent.
+    health_grade: int
     status: str
     rel_path: str | None = None
     kind: str | None = None
@@ -94,14 +112,32 @@ class Reporter:
     def __init__(self, queue: Queue) -> None:
         self._queue = queue
 
-    def trip(self, trip_id: str, sub_trip: int, status: str, **fields) -> None:
-        self._queue.put(StatusEvent("trip", trip_id, sub_trip, status, **fields))
-
-    def file(
-        self, trip_id: str, sub_trip: int, rel_path: str, status: str, **fields
+    def trip(
+        self, trip_id: str, sub_trip: int, health_grade: int, status: str, **fields
     ) -> None:
         self._queue.put(
-            StatusEvent("file", trip_id, sub_trip, status, rel_path=rel_path, **fields)
+            StatusEvent("trip", trip_id, sub_trip, health_grade, status, **fields)
+        )
+
+    def file(
+        self,
+        trip_id: str,
+        sub_trip: int,
+        health_grade: int,
+        rel_path: str,
+        status: str,
+        **fields,
+    ) -> None:
+        self._queue.put(
+            StatusEvent(
+                "file",
+                trip_id,
+                sub_trip,
+                health_grade,
+                status,
+                rel_path=rel_path,
+                **fields,
+            )
         )
 
 
@@ -118,17 +154,50 @@ def connect(db_path: Path) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=5000")
     conn.execute("PRAGMA synchronous=NORMAL")
+    _reset_if_legacy_schema(conn, db_path)
     conn.executescript(_SCHEMA)
+    conn.execute(f"PRAGMA user_version={_SCHEMA_VERSION}")
     conn.commit()
     return conn
 
 
-def completed_trip_keys(conn: sqlite3.Connection) -> set[tuple[str, int]]:
-    """Trip keys already marked terminal — these are NOT re-enqueued."""
+def _reset_if_legacy_schema(conn: sqlite3.Connection, db_path: Path) -> None:
+    """Drop tables written before ``health_grade`` was part of the trip key.
+
+    SQLite cannot add a column to a primary key, so a pre-v2 ledger cannot be
+    migrated in place — and its rows are un-migratable anyway: they never recorded
+    which grade completed, so there is no honest value to backfill. The resume
+    state is discarded (files already on disk or on S3 are still skipped per-file,
+    so nothing is re-downloaded needlessly) and the run continues.
+
+    Idempotent: ``connect`` is called once per pass plus twice per resume check.
+    """
+    tables = {
+        row[0]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('trips','files')"
+        ).fetchall()
+    }
+    if not tables:
+        return
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(trips)").fetchall()}
+    if "health_grade" in columns:
+        return
+    logger.warning(
+        "Ledger %s uses the pre-health-grade schema; resetting its resume state "
+        "(trip status was keyed by (trip_id, sub_trip) only)",
+        db_path,
+    )
+    conn.executescript("DROP TABLE IF EXISTS trips; DROP TABLE IF EXISTS files;")
+    conn.commit()
+
+
+def completed_trip_keys(conn: sqlite3.Connection) -> set[tuple[str, int, int]]:
+    """``(trip_id, sub_trip, health_grade)`` keys already complete — NOT re-enqueued."""
     rows = conn.execute(
-        f"SELECT trip_id, sub_trip FROM trips WHERE status = '{TRIP_COMPLETE}'"
+        f"SELECT trip_id, sub_trip, health_grade FROM trips WHERE status = '{TRIP_COMPLETE}'"
     ).fetchall()
-    return {(row[0], int(row[1])) for row in rows}
+    return {(row[0], int(row[1]), int(row[2])) for row in rows}
 
 
 class LedgerWriter(threading.Thread):
@@ -181,11 +250,12 @@ class LedgerWriter(threading.Thread):
         if event.scope == "trip":
             self._conn.execute(
                 """
-                INSERT INTO trips (trip_id, sub_trip, status, country, state, timezone,
-                                   file_total, error_stage, error_message,
-                                   manifest_generated_at, updated_at, retry_count)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
-                ON CONFLICT(trip_id, sub_trip) DO UPDATE SET
+                INSERT INTO trips (trip_id, sub_trip, health_grade, status, country,
+                                   state, timezone, file_total, error_stage,
+                                   error_message, manifest_generated_at, updated_at,
+                                   retry_count)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+                ON CONFLICT(trip_id, sub_trip, health_grade) DO UPDATE SET
                     status=excluded.status,
                     country=COALESCE(excluded.country, trips.country),
                     state=COALESCE(excluded.state, trips.state),
@@ -202,6 +272,7 @@ class LedgerWriter(threading.Thread):
                 (
                     event.trip_id,
                     event.sub_trip,
+                    event.health_grade,
                     event.status,
                     event.country,
                     event.state,
@@ -218,10 +289,11 @@ class LedgerWriter(threading.Thread):
         else:
             self._conn.execute(
                 """
-                INSERT INTO files (trip_id, sub_trip, rel_path, kind, status, size_bytes,
-                                   error_stage, error_message, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(trip_id, sub_trip, rel_path) DO UPDATE SET
+                INSERT INTO files (trip_id, sub_trip, health_grade, rel_path, kind,
+                                   status, size_bytes, error_stage, error_message,
+                                   updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(trip_id, sub_trip, health_grade, rel_path) DO UPDATE SET
                     kind=COALESCE(excluded.kind, files.kind),
                     status=excluded.status,
                     size_bytes=COALESCE(excluded.size_bytes, files.size_bytes),
@@ -232,6 +304,7 @@ class LedgerWriter(threading.Thread):
                 (
                     event.trip_id,
                     event.sub_trip,
+                    event.health_grade,
                     event.rel_path,
                     event.kind,
                     event.status,
@@ -249,7 +322,7 @@ class LedgerWriter(threading.Thread):
         if self._failure_log is None:
             return
         line = (
-            f"{now}\t{event.trip_id}\t{event.sub_trip}\t"
+            f"{now}\t{event.trip_id}\t{event.sub_trip}\t{event.health_grade}\t"
             f"{event.error_stage or ''}\t{event.error_message or ''}\n"
         )
         with self._failure_log.open("a", encoding="utf-8") as handle:

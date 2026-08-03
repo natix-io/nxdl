@@ -21,6 +21,7 @@ from utils.path_helpers import (
     build_trip_directory_path,
     build_camera_directory_path,
     get_r2_url_from_presigned_url,
+    is_camera_allowed,
 )
 from app.ds_formatter import format_ds
 from app.validation import validate_trip
@@ -71,11 +72,13 @@ def get_trip_manifest(
     dataset_id: str,
     trip_id: str,
     sub_trip: int,
+    health_grade: int = 500,
 ) -> TripManifest:
     """Fetch and parse the trip manifest response."""
     url = (
         f"{settings.base_url}/v1/trip/manifest"
         f"?dataset_id={dataset_id}&trip_id={trip_id}&sub_trip={sub_trip}"
+        f"&health_grade={health_grade}"
     )
     response = _api_get(url, api_key)
     return TripManifest.model_validate(response.json())
@@ -127,6 +130,8 @@ def _iter_trip_tasks(
                 )
             )
         for camera in minute.cameras:
+            if not is_camera_allowed(camera.camera_type):
+                continue
             camera_dir = build_camera_directory_path(
                 minute_dir=minute_dir, camera_type=camera.camera_type
             )
@@ -145,14 +150,15 @@ def _iter_trip_tasks(
                     _DownloadTask("video", camera.camera.presigned_url, camera_path)
                 )
 
-            telemetry_path = build_camera_file_path(
-                camera_dir, camera.telemetry.presigned_url
-            )
-            tasks.append(
-                _DownloadTask(
-                    "telemetry", camera.telemetry.presigned_url, telemetry_path
+            if manifest.health_grade != 0 and camera.telemetry is not None:
+                telemetry_path = build_camera_file_path(
+                    camera_dir, camera.telemetry.presigned_url
                 )
-            )
+                tasks.append(
+                    _DownloadTask(
+                        "telemetry", camera.telemetry.presigned_url, telemetry_path
+                    )
+                )
 
             if output.footage.sei is not None and camera.sei is not None:
                 sei_path = camera_path.with_suffix(".sei")
@@ -234,6 +240,7 @@ def _record_download_failures(
     reporter: Reporter,
     trip_id: str,
     sub_trip: int,
+    health_grade: int,
     cache_trip_dir: Path,
     failures: list[tuple[_DownloadTask, str]],
 ) -> None:
@@ -252,6 +259,7 @@ def _record_download_failures(
         reporter.file(
             trip_id,
             sub_trip,
+            health_grade,
             rel,
             "failed",
             kind=task.kind,
@@ -266,6 +274,7 @@ def _record_download_failures(
     reporter.trip(
         trip_id,
         sub_trip,
+        health_grade,
         TRIP_PARTIAL,
         error_stage="download",
         error_message=f"{len(failures)} file(s) failed to download: {summary}",
@@ -297,6 +306,7 @@ def process_trip(
     reporter: Reporter,
     present_keys: set[str] | None = None,
     s3_target: tuple[str, str] | None = None,
+    health_grade: int = 500,
 ) -> None:
     """Download, format, move and (optionally) upload one trip, tracking status.
 
@@ -309,7 +319,9 @@ def process_trip(
     from app.manifest_coverage import build_expected_trip_files  # noqa: PLC0415
 
     try:
-        trip_manifest = get_trip_manifest(api_key, dataset_id, trip_id, sub_trip)
+        trip_manifest = get_trip_manifest(
+            api_key, dataset_id, trip_id, sub_trip, health_grade
+        )
     except Exception as exc:
         logger.exception(
             "Failed to fetch trip manifest for trip %s_%d", trip_id, sub_trip
@@ -317,6 +329,7 @@ def process_trip(
         reporter.trip(
             trip_id,
             sub_trip,
+            health_grade,
             TRIP_FAILED,
             error_stage="manifest_fetch",
             error_message=f"{type(exc).__name__}: {exc}",
@@ -330,6 +343,7 @@ def process_trip(
     reporter.trip(
         trip_id,
         sub_trip,
+        health_grade,
         TRIP_IN_PROGRESS,
         country=country,
         state=state,
@@ -338,7 +352,9 @@ def process_trip(
         manifest_generated_at=str(trip_manifest.manifest_generated_at),
     )
 
-    final_dir = build_trip_directory_path(output_dir, country, state, trip_id, sub_trip)
+    final_dir = build_trip_directory_path(
+        output_dir, country, state, trip_id, sub_trip, health_grade
+    )
     final_rel = final_dir.relative_to(output_dir).as_posix()
 
     # Fast resume: if the trip is already fully on S3, mark complete without
@@ -348,14 +364,18 @@ def process_trip(
         expected_keys = _expected_s3_keys(prefix, final_rel, expected_rel)
         if expected_keys and present_keys_cover(present_keys, expected_keys):
             for rel in expected_rel:
-                reporter.file(trip_id, sub_trip, rel.as_posix(), "uploaded")
-            reporter.trip(trip_id, sub_trip, TRIP_COMPLETE)
+                reporter.file(
+                    trip_id, sub_trip, health_grade, rel.as_posix(), "uploaded"
+                )
+            reporter.trip(trip_id, sub_trip, health_grade, TRIP_COMPLETE)
             logger.debug(
                 "Trip %s_%d already complete on S3; skipped", trip_id, sub_trip
             )
             return
 
-    cache_trip_dir = build_cache_trip_path(settings.cache_dir, trip_id, sub_trip)
+    cache_trip_dir = build_cache_trip_path(
+        settings.cache_dir, trip_id, sub_trip, health_grade
+    )
     try:
         tasks = _iter_trip_tasks(cache_trip_dir, trip_manifest, output)
         failures = _download_trip_tasks(tasks)
@@ -363,7 +383,7 @@ def process_trip(
             # Retry once with a fresh manifest in case presigned URLs expired.
             try:
                 trip_manifest = get_trip_manifest(
-                    api_key, dataset_id, trip_id, sub_trip
+                    api_key, dataset_id, trip_id, sub_trip, health_grade
                 )
                 tasks = _iter_trip_tasks(cache_trip_dir, trip_manifest, output)
                 failures = _download_trip_tasks(tasks)
@@ -374,7 +394,7 @@ def process_trip(
 
         if failures:
             _record_download_failures(
-                reporter, trip_id, sub_trip, cache_trip_dir, failures
+                reporter, trip_id, sub_trip, health_grade, cache_trip_dir, failures
             )
             return
 
@@ -385,6 +405,7 @@ def process_trip(
         reporter.trip(
             trip_id,
             sub_trip,
+            health_grade,
             TRIP_FAILED,
             error_stage="process",
             error_message=f"{type(exc).__name__}: {exc}",
@@ -405,6 +426,7 @@ def process_trip(
         reporter.trip(
             trip_id,
             sub_trip,
+            health_grade,
             TRIP_FAILED,
             error_stage="validation",
             error_message=f"{type(exc).__name__}: {exc}",
@@ -420,6 +442,7 @@ def process_trip(
         reporter.trip(
             trip_id,
             sub_trip,
+            health_grade,
             TRIP_FAILED,
             error_stage="validation",
             error_message=f"{len(messages)} validation failure(s): {summary}",
@@ -447,6 +470,7 @@ def process_trip(
         reporter.trip(
             trip_id,
             sub_trip,
+            health_grade,
             TRIP_FAILED,
             error_stage="process",
             error_message=f"{type(exc).__name__}: {exc}",
@@ -455,12 +479,19 @@ def process_trip(
 
     if s3_target is None:
         for rel in expected_rel:
-            reporter.file(trip_id, sub_trip, rel.as_posix(), "downloaded")
-        reporter.trip(trip_id, sub_trip, TRIP_COMPLETE)
+            reporter.file(trip_id, sub_trip, health_grade, rel.as_posix(), "downloaded")
+        reporter.trip(trip_id, sub_trip, health_grade, TRIP_COMPLETE)
         return
 
     _upload_and_finalize(
-        final_dir, output_dir, trip_id, sub_trip, expected_rel, s3_target, reporter
+        final_dir,
+        output_dir,
+        trip_id,
+        sub_trip,
+        health_grade,
+        expected_rel,
+        s3_target,
+        reporter,
     )
 
 
@@ -469,6 +500,7 @@ def _upload_and_finalize(
     output_dir: Path,
     trip_id: str,
     sub_trip: int,
+    health_grade: int,
     expected_rel: list[Path],
     s3_target: tuple[str, str],
     reporter: Reporter,
@@ -488,6 +520,7 @@ def _upload_and_finalize(
         reporter.trip(
             trip_id,
             sub_trip,
+            health_grade,
             TRIP_FAILED,
             error_stage="s3_upload",
             error_message=f"{type(exc).__name__}: {exc}",
@@ -503,6 +536,7 @@ def _upload_and_finalize(
         reporter.trip(
             trip_id,
             sub_trip,
+            health_grade,
             TRIP_PARTIAL,
             error_stage="s3_upload",
             error_message=f"{detail}; rolled back (no partial trip on S3)",
@@ -516,8 +550,8 @@ def _upload_and_finalize(
         return
 
     for rel in expected_rel:
-        reporter.file(trip_id, sub_trip, rel.as_posix(), "uploaded")
-    reporter.trip(trip_id, sub_trip, TRIP_COMPLETE)
+        reporter.file(trip_id, sub_trip, health_grade, rel.as_posix(), "uploaded")
+    reporter.trip(trip_id, sub_trip, health_grade, TRIP_COMPLETE)
     logger.debug(
         "Uploaded all %d file(s) of trip %s_%d to s3://%s/%s",
         result.uploaded,

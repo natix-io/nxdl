@@ -11,7 +11,6 @@ from pathlib import Path
 from app.trip_downloader import get_dataset_request, get_ds_manifest
 from app.validation import (
     DATASET_REQUEST_FILENAME,
-    TRIP_DIR_RE,
     TripReport,
     ValidationIssue,
     ValidationReport,
@@ -19,9 +18,12 @@ from app.validation import (
     _load_saved_dataset_request,
     _should_omit_missing_file_report,
     collect_missing_files,
+    parse_trip_dir_name,
     validate_dataset,
 )
 from app.manifest_coverage import ManifestCoverageResult, collect_manifest_missing_files
+from schemas.camera_selection import CAMERA_SELECTION
+from utils.path_helpers import resolve_camera_selection
 from utils.s3_dataset import (
     build_snapshot,
     dataset_root,
@@ -29,6 +31,7 @@ from utils.s3_dataset import (
     overlay_local_file,
 )
 from utils.settings import settings
+from utils.trip_list import TripKey, format_trip_key, parse_trip_line, trip_matches
 
 logging.basicConfig(
     level=logging.INFO,
@@ -52,26 +55,51 @@ class S3ReportContext:
 
     uri: str
     request_note: str | None = None
-    expected_trips: set[tuple[str, int]] | None = None
+    # Trip identity is (trip_id, sub_trip, health_grade): one dataset can contain the
+    # same pair at several grades, each its own directory with its own files. Collapsing
+    # to the pair would report a dataset with one grade uploaded as fully covered.
+    expected_trips: set[tuple[str, int, int]] | None = None
     coverage_note: str | None = None
-    uploaded_trips: set[tuple[str, int]] = field(default_factory=set)
+    uploaded_trips: set[tuple[str, int, int]] = field(default_factory=set)
     skipped_trip_count: int = 0
 
     @property
-    def missing_trips(self) -> list[tuple[str, int]]:
+    def missing_trips(self) -> list[tuple[str, int, int]]:
         if self.expected_trips is None:
             return []
         return sorted(self.expected_trips - self.uploaded_trips)
 
     @property
-    def unexpected_trips(self) -> list[tuple[str, int]]:
+    def unexpected_trips(self) -> list[tuple[str, int, int]]:
         if self.expected_trips is None:
             return []
         return sorted(self.uploaded_trips - self.expected_trips)
 
 
+def _apply_camera_selection(
+    flag_value: CAMERA_SELECTION | None,
+) -> CAMERA_SELECTION:
+    """Resolve the effective camera selection and make it the process-wide setting.
+
+    ``--camera-selection`` is an override of the CAMERA_SELECTION setting, so it
+    has to reach every consumer — not just validate_dataset. Manifest coverage
+    builds its expected-file set through
+    ``manifest_coverage.build_expected_trip_files``, which resolves the selection
+    from settings; without this, a front-only dataset validated via the flag
+    passes the camera checks but reports every unselected camera's file as
+    manifest-missing.
+    """
+    selection = resolve_camera_selection(flag_value)
+    settings.camera_selection = selection
+    return selection
+
+
 def main() -> None:
     args = _parse_args()
+
+    camera_selection = _apply_camera_selection(args.camera_selection)
+    source = "--camera-selection" if args.camera_selection is not None else "settings"
+    print(f"Camera selection: {camera_selection} (from {source})")
 
     s3_context: S3ReportContext | None = None
     manifest_coverage: ManifestCoverageResult | None = None
@@ -86,6 +114,7 @@ def main() -> None:
         report = validate_dataset(
             dataset_dir=args.dataset_dir,
             allowed_root_files=allowed_root_files,
+            camera_selection=camera_selection,
         )
         manifest_coverage = _collect_manifest_coverage(
             report,
@@ -111,15 +140,17 @@ def main() -> None:
     sys.exit(_validation_exit_code(report, manifest_coverage))
 
 
-def _parse_trip_key(trip: str) -> tuple[str, int]:
-    match = TRIP_DIR_RE.fullmatch(trip.strip())
-    if match is None:
+def _parse_trip_key(trip: str) -> TripKey:
+    """``--trip`` value → a requested key; an omitted grade means "any grade"."""
+    parsed = parse_trip_line(trip.strip())
+    if parsed is None:
         print(
-            f"Invalid --trip value {trip!r}; expected '<trip_id>_<sub_trip>'.",
+            f"Invalid --trip value {trip!r}; expected "
+            "'<trip_id>_<sub_trip>[_<health_grade>]'.",
             file=sys.stderr,
         )
         sys.exit(2)
-    return match.group("trip_id"), int(match.group("sub_trip"))
+    return parsed
 
 
 def _validate_on_s3(
@@ -158,39 +189,41 @@ def _validate_on_s3(
     # the manifest's trips, so trip folders from other datasets sharing the
     # prefix don't pollute the report (they'd be judged against the wrong
     # dataset request anyway).
-    parsed_trip_dirs: list[tuple[Path, tuple[str, int]]] = []
+    parsed_trip_dirs: list[tuple[Path, tuple[str, int, int]]] = []
     if root.is_dir():
         for trip_dir in _discover_trip_dirs(root):
-            match = TRIP_DIR_RE.fullmatch(trip_dir.name)
-            if match:
-                parsed_trip_dirs.append(
-                    (trip_dir, (match.group("trip_id"), int(match.group("sub_trip"))))
-                )
+            try:
+                trip_key = parse_trip_dir_name(trip_dir.name)
+            except ValueError:
+                continue
+            parsed_trip_dirs.append((trip_dir, trip_key))
     context.uploaded_trips = {trip_key for _, trip_key in parsed_trip_dirs}
 
     trip: str | None = args.trip
-    selected_trip: tuple[str, int] | None = (
-        _parse_trip_key(trip) if trip is not None else None
-    )
+    selected_trip: TripKey | None = _parse_trip_key(trip) if trip is not None else None
     if selected_trip is not None:
-        matching_trip_dirs = [
-            trip_dir
+        selection = {selected_trip}
+        matching = [
+            (trip_dir, trip_key)
             for trip_dir, trip_key in parsed_trip_dirs
-            if trip_key == selected_trip
+            if trip_matches(selection, *trip_key)
         ]
-        if not matching_trip_dirs:
+        if not matching:
             print(
                 f"Trip {trip} was not found under {uri}.",
                 file=sys.stderr,
             )
             sys.exit(2)
-        context.expected_trips = {selected_trip}
-        context.uploaded_trips = {selected_trip}
+        # A --trip without a grade selects every grade of that pair, so the
+        # expected/uploaded sets are the matched directories, not one key.
+        matched_keys = {trip_key for _, trip_key in matching}
+        context.expected_trips = matched_keys
+        context.uploaded_trips = matched_keys
         context.coverage_note = f"validation limited to trip {trip}"
         trip_dirs_to_drop = [
             trip_dir
             for trip_dir, trip_key in parsed_trip_dirs
-            if trip_key != selected_trip
+            if not trip_matches(selection, *trip_key)
         ]
         if trip_dirs_to_drop:
             context.skipped_trip_count = len(trip_dirs_to_drop)
@@ -211,7 +244,11 @@ def _validate_on_s3(
             )
             root = dataset_root(snapshot)
 
-    report = validate_dataset(dataset_dir=root, allowed_root_files=frozenset())
+    report = validate_dataset(
+        dataset_dir=root,
+        allowed_root_files=frozenset(),
+        camera_selection=_apply_camera_selection(args.camera_selection),
+    )
     manifest_coverage = _collect_manifest_coverage(
         report,
         trip_filter=context.expected_trips,
@@ -224,7 +261,7 @@ def _validate_on_s3(
 def _collect_manifest_coverage(
     report: ValidationReport,
     *,
-    trip_filter: set[tuple[str, int]] | None,
+    trip_filter: set[tuple[str, int, int]] | None,
     max_trips: int | None,
     uploaded_only: bool,
 ) -> ManifestCoverageResult | None:
@@ -279,7 +316,7 @@ def _resolve_local_dataset_request() -> tuple[Path, str]:
     return local_path, f"downloaded from the API to {local_path} (not found on S3)"
 
 
-def _fetch_expected_trips() -> tuple[set[tuple[str, int]] | None, str | None]:
+def _fetch_expected_trips() -> tuple[set[tuple[str, int, int]] | None, str | None]:
     """The dataset's full trip set from the API manifest, or a note on why not."""
     api_key = settings.api_key.strip()
     dataset_id = settings.dataset_id.strip()
@@ -295,7 +332,9 @@ def _fetch_expected_trips() -> tuple[set[tuple[str, int]] | None, str | None]:
             None,
             f"trip coverage skipped: failed to fetch the dataset manifest: {exc}",
         )
-    return {(trip.trip_id, trip.sub_trip) for trip in ds_manifest.trips}, None
+    return {
+        (trip.trip_id, trip.sub_trip, trip.health_grade) for trip in ds_manifest.trips
+    }, None
 
 
 def _print_report(
@@ -409,15 +448,15 @@ def _write_trip_coverage(write, s3_context: S3ReportContext | None) -> None:
     missing = s3_context.missing_trips
     if missing:
         write("Missing trips (in the dataset manifest, not on S3)\n")
-        for trip_id, sub_trip in missing:
-            write(f"- {trip_id}_{sub_trip}\n")
+        for trip_key in missing:
+            write(f"- {format_trip_key(trip_key)}\n")
         write("\n")
 
     unexpected = s3_context.unexpected_trips
     if unexpected:
         write("Unexpected trips (on S3, not in the dataset manifest)\n")
-        for trip_id, sub_trip in unexpected:
-            write(f"- {trip_id}_{sub_trip}\n")
+        for trip_key in unexpected:
+            write(f"- {format_trip_key(trip_key)}\n")
         write("\n")
 
 
@@ -642,6 +681,18 @@ def _parse_args() -> argparse.Namespace:
         help=(
             "Limit manifest file coverage to the first N trips (uploaded trips "
             "first when combined with --manifest-uploaded-only)."
+        ),
+    )
+    parser.add_argument(
+        "--camera-selection",
+        type=CAMERA_SELECTION,
+        choices=list(CAMERA_SELECTION),
+        default=None,
+        metavar="{front,front_rear,all}",
+        help=(
+            "Which cameras each minute is required to have. Omit to use "
+            "CAMERA_SELECTION from the active .env (default 'all'). Pass the "
+            "same value that was used for the download."
         ),
     )
     parser.add_argument(

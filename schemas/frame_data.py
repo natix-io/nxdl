@@ -6,6 +6,23 @@ from schemas.dataset_request import FootageCSVFormat
 
 _NA = "na"
 
+# The delivered telemetry CSV columns, in order, for FootageCSVFormat.default. Narrower
+# than FrameData itself: the service writes every field it models, and the client keeps
+# only these. Single source of truth for both to_csv_row and csv_fieldnames.
+_DEFAULT_CSV_FIELDS = (
+    "timestamp",
+    "frame_number",
+    "GPS_latitude_deg",
+    "GPS_longitude_deg",
+    "horizontal_accuracy_m",
+    "speed_mps",
+    "velocity_north_mps",
+    "velocity_east_mps",
+    "heading_deg",
+    "heading_accuracy_deg",
+    "image_direction",
+)
+
 
 @dataclass
 class FrameData:
@@ -67,6 +84,21 @@ class FrameData:
             heading_deg_phone=_opt_str(row.get("heading_deg_phone")),
         )
 
+    @classmethod
+    def csv_fieldnames(cls, fmt: FootageCSVFormat = FootageCSVFormat.default) -> list[str]:
+        """The CSV column names for a format, without needing a row.
+
+        Shares `_DEFAULT_CSV_FIELDS` with `to_csv_row` so the two cannot drift. Needed to
+        write a header for a minute that has no telemetry rows at all: the service emits
+        those CSVs with headers and no data (a minute whose device/phone logs are absent),
+        and the delivered file must carry the same columns as its populated siblings.
+        """
+        if fmt is FootageCSVFormat.default:
+            return list(_DEFAULT_CSV_FIELDS)
+        if fmt is FootageCSVFormat.here_tech:
+            return ["time", "latitude", "longitude"]
+        raise ValueError(f"Unsupported footage CSV format: {fmt}")
+
     def to_csv_row(
         self,
         fmt: FootageCSVFormat = FootageCSVFormat.default,
@@ -77,22 +109,9 @@ class FrameData:
         Returns None when the format dictates this row should be skipped
         (e.g. here_tech rows without GPS).
         """
-        fields_to_include = [
-            "timestamp",
-            "frame_number",
-            "GPS_latitude_deg",
-            "GPS_longitude_deg",
-            "horizontal_accuracy_m",
-            "speed_mps",
-            "velocity_north_mps",
-            "velocity_east_mps",
-            "heading_deg",
-            "heading_accuracy_deg",
-            "image_direction"
-        ]
         if fmt is FootageCSVFormat.default:
             row: dict = {"timestamp": self.timestamp}
-            for field in fields_to_include:
+            for field in _DEFAULT_CSV_FIELDS:
                 value = getattr(self, field)
                 row[field] = value if value is not None else default_value_for_none
             return row

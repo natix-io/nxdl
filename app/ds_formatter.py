@@ -24,6 +24,7 @@ from utils.path_helpers import (
     build_feature_file_path, build_fixed_metadata_path, build_minute_directory_path,
     build_trip_insight_path,
     get_camera_type,
+    is_camera_allowed,
 )
 from utils.settings import settings
 
@@ -44,9 +45,11 @@ def format_ds(trip_manifest: TripManifest, trip_dir: Path, output: DatasetOutput
         return
 
     embed_exif = output.footage.embed_exif
-    csv_enabled = output.footage.csv is not None
+    # Grade 0 is video-only, categorically — no telemetry CSV/MCAP is ever
+    # produced for it, even on a minute that happens to have telemetry.
+    csv_enabled = output.footage.csv is not None and trip_manifest.health_grade != 0
     csv_fmt = output.footage.csv
-    mcap_enabled = output.footage.mcap is not None
+    mcap_enabled = output.footage.mcap is not None and trip_manifest.health_grade != 0
     mcap_fmt = output.footage.mcap
     write_mapping = output.minute.mapping_file
     timezone = _get_timezone(trip_manifest)
@@ -54,10 +57,15 @@ def format_ds(trip_manifest: TripManifest, trip_dir: Path, output: DatasetOutput
     for minute in trip_manifest.minutes:
         minute_dir = build_minute_directory_path(trip_dir, minute.minute_epoch, timezone)
         for camera in minute.cameras:
+            if not is_camera_allowed(camera.camera_type):
+                continue
             camera_dir = build_camera_directory_path(
                 minute_dir,
                 camera_type=camera.camera_type,
             )
+
+            if trip_manifest.health_grade == 0 or camera.telemetry is None:
+                continue
 
             telemetry_path = build_camera_file_path(
                 camera_dir, camera.telemetry.presigned_url,
@@ -79,10 +87,7 @@ def format_ds(trip_manifest: TripManifest, trip_dir: Path, output: DatasetOutput
             if mcap_enabled:
                 _handle_footage_mcap_format(telemetry_path, frames, timezone, mcap_fmt)
         if write_mapping:
-            _handle_minute_mapping_file(
-                minute_dir,
-                minute,
-            )
+            _handle_minute_mapping_file(minute_dir, minute)
 
 
 # ---------------------------------------------------------------------------
@@ -205,7 +210,24 @@ def _handle_footage_csv_format(
             rows.append(row)
 
     if not rows:
-        logger.warning("No rows after format conversion, skipping: %s", telemetry_path)
+        if frames:
+            # Rows existed but the format dropped them all (here_tech skips frames without
+            # GPS). Leave the file as downloaded rather than blanking real telemetry.
+            logger.warning("No rows after format conversion, skipping: %s", telemetry_path)
+            return
+        # The source CSV had no telemetry rows at all — a minute whose device/phone logs
+        # were absent. The service writes those with headers and no data on purpose, so
+        # rewrite the header here too. Without this the file keeps the service's wider
+        # column set while every populated sibling gets the narrower delivered one, and a
+        # single dataset ends up with two different telemetry schemas.
+        with telemetry_path.open("w", newline="") as f:
+            csv.DictWriter(
+                f, fieldnames=FrameData.csv_fieldnames(footage_csv_format)
+            ).writeheader()
+        logger.info(
+            "Rewrote %s with 0 rows (header only) in '%s' format",
+            telemetry_path, footage_csv_format.value,
+        )
         return
 
     with telemetry_path.open("w", newline="") as f:
@@ -244,6 +266,8 @@ def _handle_minute_mapping_file(
 
     lines: list[str] = []
     for camera in minute.cameras:
+        if not is_camera_allowed(camera.camera_type):
+            continue
         camera_type = camera.camera_type or "unknown"
         camera_dir = build_camera_directory_path(minute_dir, camera_type=camera_type)
         folder_name = camera_dir.name

@@ -18,7 +18,12 @@ from utils.download import sweep_partial_files
 from utils.ledger import LedgerWriter, Reporter, connect
 from utils.s3_uploader import parse_s3_uri, prune_empty_dirs, upload_and_remove_file
 from utils.settings import settings
-from utils.trip_list import load_trips_from_file
+from utils.trip_list import (
+    TripKey,
+    format_trip_key,
+    load_trips_from_file,
+    trip_matches,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +42,45 @@ def _safe_name(value: str) -> str:
 
 def _ledger_path(dataset_id: str) -> Path:
     return STATE_DIR / f"{_safe_name(dataset_id)}.db"
+
+
+def _unmatched_requested_trips(
+    all_trips: list[tuple[str, int, int]],
+    requested: list[TripKey],
+) -> list[TripKey]:
+    """Requested TRIPS_FILE keys that no trip in the dataset satisfies."""
+    return [
+        trip
+        for trip in requested
+        if not any(trip_matches({trip}, *candidate) for candidate in all_trips)
+    ]
+
+
+def _filter_requested_trips(
+    all_trips: list[tuple[str, int, int]],
+    requested: list[TripKey],
+) -> list[tuple[str, int, int]]:
+    """Keep only trips selected by TRIPS_FILE.
+
+    A line without a health_grade means "whichever grade(s) the dataset has for this
+    trip"; a line with one selects that grade only. See ``utils.trip_list``.
+    """
+    requested_set = set(requested)
+    return [trip for trip in all_trips if trip_matches(requested_set, *trip)]
+
+
+def _filter_pending_trips(
+    all_trips: list[tuple[str, int, int]],
+    done: set[tuple[str, int, int]],
+) -> list[tuple[str, int, int]]:
+    """Keep only trips not yet marked complete in the ledger.
+
+    The comparison is on the whole ``(trip_id, sub_trip, health_grade)`` key: one
+    dataset can hold the same pair at several grades, and each is a separate trip
+    with its own files. Matching on the pair alone would drop every other grade as
+    soon as one of them completed — a silent loss on resume.
+    """
+    return [trip for trip in all_trips if trip not in done]
 
 
 def _setup_logging(stamp: str) -> Path:
@@ -133,7 +177,7 @@ def _trip_worker(
     reporter = Reporter(status_queue)
     while True:
         try:
-            trip_id, sub_trip = task_queue.get_nowait()
+            trip_id, sub_trip, health_grade = task_queue.get_nowait()
         except Empty:
             break
         process_trip(
@@ -146,11 +190,12 @@ def _trip_worker(
             reporter=reporter,
             present_keys=present_keys,
             s3_target=s3_target,
+            health_grade=health_grade,
         )
 
 
 def _run_pass(
-    trips: list[tuple[str, int]],
+    trips: list[tuple[str, int, int]],
     *,
     api_key: str,
     dataset_id: str,
@@ -278,7 +323,9 @@ def main() -> None:
         except Exception:
             logger.exception("Could not list S3 for resume; continuing without it")
 
-    all_trips = [(trip.trip_id, trip.sub_trip) for trip in ds_manifest.trips]
+    all_trips = [
+        (trip.trip_id, trip.sub_trip, trip.health_grade) for trip in ds_manifest.trips
+    ]
 
     # Optional subset: process only the trips listed in TRIPS_FILE.
     if settings.trips_file.strip():
@@ -288,17 +335,16 @@ def main() -> None:
         except FileNotFoundError:
             logger.error("TRIPS_FILE not found: %s", trips_path)
             sys.exit(1)
-        manifest_set = set(all_trips)
-        missing = [t for t in requested if t not in manifest_set]
+        dataset_trip_count = len(all_trips)
+        missing = _unmatched_requested_trips(all_trips, requested)
         if missing:
             logger.warning(
                 "%d requested trip(s) are not in dataset %s and will be skipped: %s",
                 len(missing),
                 dataset_id,
-                ", ".join(f"{tid}_{sub}" for tid, sub in missing),
+                ", ".join(format_trip_key(trip) for trip in missing),
             )
-        requested_set = set(requested)
-        all_trips = [t for t in all_trips if t in requested_set]
+        all_trips = _filter_requested_trips(all_trips, requested)
         if not all_trips:
             logger.error(
                 "None of the %d requested trip(s) are in dataset %s; nothing to do.",
@@ -310,20 +356,23 @@ def main() -> None:
             "Trip filter active (%s): processing %d of %d dataset trip(s)",
             trips_path,
             len(all_trips),
-            len(manifest_set),
+            dataset_trip_count,
         )
 
     total = len(all_trips)
+    # Only trips in scope for this run count towards the tally — the ledger may hold
+    # complete rows for trips a TRIPS_FILE subset excluded.
+    in_scope = set(all_trips)
 
     # Resume: skip trips already marked complete in the ledger.
     conn = connect(db_path)
     done = ledger.completed_trip_keys(conn)
     conn.close()
-    pending = [trip for trip in all_trips if trip not in done]
+    pending = _filter_pending_trips(all_trips, done)
     if done:
         logger.info(
             "Resuming: %d/%d trip(s) already complete, %d to process",
-            len(done),
+            len(done & in_scope),
             total,
             len(pending),
         )
@@ -349,7 +398,7 @@ def main() -> None:
         conn = connect(db_path)
         done = ledger.completed_trip_keys(conn)
         conn.close()
-        pending = [trip for trip in all_trips if trip not in done]
+        pending = _filter_pending_trips(all_trips, done)
         if not pending:
             break
         if pass_num >= settings.max_retry_passes:
@@ -374,7 +423,7 @@ def main() -> None:
             )
         prune_empty_dirs(output_dir, remove_root=False)
 
-    completed = len(done)
+    completed = len(done & in_scope)
     logger.info(
         "Finished dataset %s: %d/%d trip(s) complete", dataset_id, completed, total
     )

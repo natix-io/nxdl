@@ -43,6 +43,14 @@ To do a dry run (fetch manifests without downloading any files):
 ./run.sh --api-key <YOUR_API_KEY> --dataset-id <YOUR_DATASET_ID> --output-dir /path/to/dataset --dry-run
 ```
 
+To keep only a subset of cameras (`all` (default), `front`, or `front_rear`):
+
+```bash
+./run.sh --api-key <YOUR_API_KEY> --dataset-id <YOUR_DATASET_ID> --output-dir /path/to/dataset --camera-selection front
+```
+
+If you always want the same subset, set `CAMERA_SELECTION=front` in `.env.production` instead — both `./run.sh` and `./validate.sh` read it, so they stay in agreement.
+
 Run `./run.sh --help` for the full usage.
 
 ## Validate
@@ -57,6 +65,12 @@ To save a full report with every trip listed (including `PASS`):
 
 ```bash
 ./validate.sh --output-dir /path/to/dataset --output /path/to/dataset/qa_report.txt
+```
+
+If you downloaded with `--camera-selection`, pass the same value here so the validator doesn't report the cameras you deliberately skipped as missing (not needed if the value comes from `.env.production`):
+
+```bash
+./validate.sh --output-dir /path/to/dataset --camera-selection front
 ```
 
 The validator scans the local dataset folder and prints:

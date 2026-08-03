@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from app.trip_downloader import get_ds_manifest, get_trip_manifest
-from app.validation import TRIP_DIR_RE, _discover_trip_dirs
+from app.validation import _discover_trip_dirs, parse_trip_dir_name
 from schemas.dataset_request import DatasetOutput, SavedDatasetRequest
 from schemas.trip_manifest import TripManifest
 from utils.path_helpers import (
@@ -15,8 +15,10 @@ from utils.path_helpers import (
     build_fused_sei_path,
     build_minute_directory_path,
     build_trip_insight_path,
+    is_camera_allowed,
 )
 from utils.settings import settings
+from utils.trip_list import format_trip_key
 
 
 @dataclass(slots=True)
@@ -79,6 +81,8 @@ def build_expected_trip_files(
             expected.append((minute_dir / "mapping.txt").relative_to(trip_root))
 
         for camera in minute.cameras:
+            if not is_camera_allowed(camera.camera_type):
+                continue
             camera_type = camera.camera_type or "unknown"
             camera_dir = build_camera_directory_path(minute_dir, camera_type)
             video_path = build_camera_video_path(
@@ -89,10 +93,11 @@ def build_expected_trip_files(
             )
             expected.append(video_path.relative_to(trip_root))
 
-            telemetry_path = build_camera_file_path(
-                camera_dir, camera.telemetry.presigned_url
-            )
-            expected.append(telemetry_path.relative_to(trip_root))
+            if trip_manifest.health_grade != 0 and camera.telemetry is not None:
+                telemetry_path = build_camera_file_path(
+                    camera_dir, camera.telemetry.presigned_url
+                )
+                expected.append(telemetry_path.relative_to(trip_root))
 
             if output.footage.sei is not None and camera.sei is not None:
                 sei_path = video_path.with_suffix(".sei")
@@ -106,7 +111,7 @@ def collect_manifest_missing_files(
     dataset_dir: Path,
     saved_request: SavedDatasetRequest,
     *,
-    trip_filter: set[tuple[str, int]] | None = None,
+    trip_filter: set[tuple[str, int, int]] | None = None,
     max_trips: int | None = None,
     uploaded_only: bool = False,
 ) -> ManifestCoverageResult:
@@ -140,19 +145,24 @@ def collect_manifest_missing_files(
         trips_to_check = [
             trip
             for trip in trips_to_check
-            if (trip.trip_id, trip.sub_trip) in trip_filter
+            if (trip.trip_id, trip.sub_trip, trip.health_grade) in trip_filter
         ]
     if uploaded_only:
         trips_to_check = [
             trip
             for trip in trips_to_check
-            if (trip.trip_id, trip.sub_trip) in discovered_trips
+            if (trip.trip_id, trip.sub_trip, trip.health_grade) in discovered_trips
         ]
     trips_to_check.sort(
         key=lambda trip: (
-            0 if (trip.trip_id, trip.sub_trip) in discovered_trips else 1,
+            # discovered_trips is keyed by the full three-part identity — comparing a
+            # pair here silently made this sort key constant.
+            0
+            if (trip.trip_id, trip.sub_trip, trip.health_grade) in discovered_trips
+            else 1,
             trip.trip_id,
             trip.sub_trip,
+            trip.health_grade,
         )
     )
     coverage_notes: list[str] = []
@@ -167,7 +177,7 @@ def collect_manifest_missing_files(
     def _fetch(ds_trip):
         try:
             manifest = get_trip_manifest(
-                api_key, dataset_id, ds_trip.trip_id, ds_trip.sub_trip
+                api_key, dataset_id, ds_trip.trip_id, ds_trip.sub_trip, ds_trip.health_grade
             )
             return ds_trip, manifest, None
         except Exception as exc:
@@ -182,17 +192,17 @@ def collect_manifest_missing_files(
         fetched = [_fetch(ds_trip) for ds_trip in trips_to_check]
 
     for ds_trip, trip_manifest, exc in fetched:
-        trip_key = (ds_trip.trip_id, ds_trip.sub_trip)
+        trip_key = (ds_trip.trip_id, ds_trip.sub_trip, ds_trip.health_grade)
 
         if exc is not None:
-            fetch_errors.append(f"{ds_trip.trip_id}_{ds_trip.sub_trip}: {exc}")
+            fetch_errors.append(f"{format_trip_key(trip_key)}: {exc}")
             continue
 
         trip_dir = discovered_trips.get(trip_key)
         if trip_dir is None:
             # The whole trip is absent — report it once as a missing trip instead of
             # enumerating every expected file as "missing".
-            missing_trips.append(f"{ds_trip.trip_id}_{ds_trip.sub_trip}")
+            missing_trips.append(format_trip_key(trip_key))
             continue
 
         trip_rel = _relative_path(dataset_dir, trip_dir)
@@ -252,13 +262,14 @@ def _is_expected_file_present(trip_dir: Path, relative_file: Path) -> bool:
     return False
 
 
-def _index_discovered_trips(dataset_dir: Path) -> dict[tuple[str, int], Path]:
-    indexed: dict[tuple[str, int], Path] = {}
+def _index_discovered_trips(dataset_dir: Path) -> dict[tuple[str, int, int], Path]:
+    indexed: dict[tuple[str, int, int], Path] = {}
     for trip_dir in _discover_trip_dirs(dataset_dir):
-        match = TRIP_DIR_RE.fullmatch(trip_dir.name)
-        if match is None:
+        try:
+            trip_id, sub_trip, health_grade = parse_trip_dir_name(trip_dir.name)
+        except ValueError:
             continue
-        indexed[(match.group("trip_id"), int(match.group("sub_trip")))] = trip_dir
+        indexed[(trip_id, sub_trip, health_grade)] = trip_dir
     return indexed
 
 

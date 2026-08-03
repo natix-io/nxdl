@@ -27,6 +27,10 @@ Required:
                         you gave to ./run.sh --output-dir)
 
 Optional:
+  --camera-selection <sel>  Cameras each minute is required to have:
+                            all (default) | front | front_rear. Omit to use
+                            CAMERA_SELECTION from .env.production; pass the same
+                            value that was used for ./run.sh
   -h, --help            Show this help and exit
 
 Any other arguments are passed through to the validator, e.g.:

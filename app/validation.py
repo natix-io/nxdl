@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Literal
 from typing import Any
 
+from schemas.camera_selection import CAMERA_SELECTION
 from schemas.dataset_request import (
     DatasetOutput,
     DatasetRequest,
@@ -14,9 +15,15 @@ from schemas.dataset_request import (
     SEIDataOptions,
 )
 from schemas.trip_metadata import CAMERA_TYPE
+from utils.path_helpers import (
+    allowed_camera_types_for_selection,
+    resolve_camera_selection,
+)
 from utils.settings import settings
 
-TRIP_DIR_RE = re.compile(r"(?P<trip_id>.+)_(?P<sub_trip>\d+)$")
+TRIP_DIR_RE = re.compile(
+    r"(?P<trip_id>.+?)_(?P<sub_trip>\d+)(?:_(?P<health_grade>\d+))?$"
+)
 MINUTE_DIR_RE = re.compile(r"\d{2}-\d{2}-\d{2}$")
 VIDEO_LINK_SUFFIX = ".mp4.link"
 EXPECTED_CAMERA_DIR_NAMES = {
@@ -28,6 +35,24 @@ DEFAULT_QA_REPORT_FILENAME = "qa_report.txt"
 ALLOWED_DATASET_ROOT_FILENAMES = frozenset(
     {DATASET_REQUEST_FILENAME, DEFAULT_QA_REPORT_FILENAME}
 )
+
+
+def parse_trip_dir_name(name: str) -> tuple[str, int, int]:
+    """Parse a trip folder/line name into (trip_id, sub_trip, health_grade).
+
+    health_grade defaults to 500 (unsuffixed = grade-500, matching the
+    server's health_grade_suffix() convention). Raises ValueError if
+    unparseable.
+    """
+    match = TRIP_DIR_RE.fullmatch(name)
+    if not match:
+        raise ValueError(f"Cannot parse trip directory name: {name!r}")
+    health_grade = match.group("health_grade")
+    return (
+        match.group("trip_id"),
+        int(match.group("sub_trip")),
+        int(health_grade) if health_grade is not None else 500,
+    )
 
 
 @dataclass(slots=True)
@@ -351,8 +376,10 @@ class ValidationReport:
 def validate_dataset(
     dataset_dir: Path | None = None,
     allowed_root_files: frozenset[Path] | None = None,
+    camera_selection: CAMERA_SELECTION | None = None,
 ) -> ValidationReport:
     target_dir = (dataset_dir or settings.output_dir).resolve()
+    camera_selection = resolve_camera_selection(camera_selection)
     report = ValidationReport(dataset_dir=target_dir)
 
     if not target_dir.exists():
@@ -412,7 +439,11 @@ def validate_dataset(
 
     for trip_dir in trip_dirs:
         trip_report = _validate_trip_dir(
-            report, trip_dir, active_policies, saved_request.request
+            report,
+            trip_dir,
+            active_policies,
+            saved_request.request,
+            camera_selection=camera_selection,
         )
         report.trip_reports.append(trip_report)
 
@@ -430,7 +461,11 @@ def validation_exit_code(report: ValidationReport) -> int:
 
 
 def validate_trip(
-    dataset_dir: Path, trip_dir: Path, *, check_layout: bool = True
+    dataset_dir: Path,
+    trip_dir: Path,
+    *,
+    check_layout: bool = True,
+    camera_selection: CAMERA_SELECTION | None = None,
 ) -> TripReport:
     """Validate a single trip against the saved dataset_request.json.
 
@@ -454,6 +489,7 @@ def validate_trip(
         policies,
         saved_request.request,
         check_layout=check_layout,
+        camera_selection=resolve_camera_selection(camera_selection),
     )
 
 
@@ -555,8 +591,22 @@ def _validate_trip_dir(
     dataset_request: DatasetRequest,
     *,
     check_layout: bool = True,
+    camera_selection: CAMERA_SELECTION | None = None,
 ) -> TripReport:
     trip_report = TripReport(trip_dir=trip_dir)
+    camera_selection = resolve_camera_selection(camera_selection)
+
+    try:
+        _, _, health_grade = parse_trip_dir_name(trip_dir.name)
+    except ValueError:
+        # Shouldn't happen — trip_dir names come from our own naming scheme —
+        # but don't let a malformed name crash the whole validation run.
+        _add_warning(
+            trip_report,
+            "Could not parse health_grade from trip folder name; assuming grade 500.",
+            trip_dir,
+        )
+        health_grade = 500
 
     # Country/state nesting checks only make sense once the trip sits under the
     # dataset root. When validating a trip still in the (flat) cache dir before the
@@ -611,7 +661,13 @@ def _validate_trip_dir(
 
     for minute_dir in minute_dirs:
         minute_status = _validate_minute_dir(
-            report, trip_report, minute_dir, policies, dataset_request.output
+            report,
+            trip_report,
+            minute_dir,
+            policies,
+            dataset_request.output,
+            health_grade,
+            camera_selection=camera_selection,
         )
         if minute_status.has_complete_raw_sei:
             trip_report.minutes_with_complete_raw_sei += 1
@@ -740,12 +796,93 @@ def _validate_trip_metadata_files(
         _add_warning(trip_report, "Unexpected file inside trip folder.", child)
 
 
+def _min_camera_requirement_failure(
+    camera_dirs: list[Path],
+    health_grade: int,
+    camera_selection: CAMERA_SELECTION | None = None,
+) -> str | None:
+    """Per-grade MINIMUM camera-coverage requirement. Returns a failure message,
+    or None if satisfied.
+
+    Every rule here is a lower bound: extra camera folders are never a failure.
+    The server's trip manifest is authoritative about which cameras a minute has,
+    and a grade only tells us what to expect *at least*.
+
+    The requirement is intersected with the active camera selection: when the
+    operator deliberately downloads a narrower set (CAMERA_SELECTION.FRONT /
+    FRONT_REAR), only the selected cameras can be required, and the count-based
+    clauses (grades 500/200) don't apply at all — a front-only dataset can't be
+    expected to have 4 camera folders.
+    """
+    camera_names = {c.name for c in camera_dirs}
+    camera_count = len(camera_dirs)
+    has_front = "FRONT_FOLDER" in camera_names
+    has_rear = "REAR_FOLDER" in camera_names
+
+    selection = resolve_camera_selection(camera_selection)
+    selected_types = allowed_camera_types_for_selection(selection)
+    if selected_types is not None:
+        # Restricted selection: require only the selected cameras, and drop the
+        # count-based rules (they assume a full rig was requested).
+        selected_names = {f"{ct.value.upper()}_FOLDER" for ct in selected_types}
+        missing = sorted(selected_names - camera_names)
+        if missing:
+            return (
+                f"Minute must contain the selected camera(s) for "
+                f"camera_selection={selection}: missing {missing}."
+            )
+        return None
+
+    if health_grade == 500:
+        if camera_count not in {4, 6}:
+            return f"Minute folder must contain exactly 4 or 6 camera folders, found {camera_count}."
+        return None
+    if health_grade == 400:
+        has_left = "LEFT_REPEATER_FOLDER" in camera_names or "LEFT_PILLAR_FOLDER" in camera_names
+        has_right = "RIGHT_REPEATER_FOLDER" in camera_names or "RIGHT_PILLAR_FOLDER" in camera_names
+        missing = [
+            name
+            for name, present in (
+                ("front", has_front),
+                ("back", has_rear),
+                ("left (repeater or pillar)", has_left),
+                ("right (repeater or pillar)", has_right),
+            )
+            if not present
+        ]
+        if missing:
+            return f"Grade 400 minute must contain front, back, and at least one left and one right camera; missing: {', '.join(missing)}."
+        return None
+    if health_grade == 200:
+        if not has_front or camera_count < 4:
+            return (
+                "Grade 200 minute must contain the front camera plus at least "
+                f"3 other cameras (>=4 total); found {camera_count} camera(s), "
+                f"front {'present' if has_front else 'MISSING'}."
+            )
+        return None
+    if health_grade == 150:
+        missing = [name for name, present in (("front", has_front), ("back", has_rear)) if not present]
+        if missing:
+            return f"Grade 150 minute must contain front and back cameras; missing: {', '.join(missing)}."
+        return None
+    if health_grade in (100, 0):
+        if not has_front:
+            return f"Grade {health_grade} minute must contain the front camera; none found."
+        return None
+    # Unrecognized/future grade: no additional grade-specific rule beyond the
+    # "at least one camera" check the caller already applies.
+    return None
+
+
 def _validate_minute_dir(
     report: ValidationReport,
     trip_report: TripReport,
     minute_dir: Path,
     policies: ValidationPolicies,
     output: DatasetOutput,
+    health_grade: int = 500,
+    camera_selection: CAMERA_SELECTION | None = None,
 ) -> MinuteSeiStatus:
     camera_dirs = sorted(
         child
@@ -775,12 +912,12 @@ def _validate_minute_dir(
             "Minute folder does not contain any camera folders.",
             minute_dir,
         )
-    elif camera_count not in {4, 6}:
-        _add_failure(
-            trip_report,
-            f"Minute folder must contain exactly 4 or 6 camera folders, found {camera_count}.",
-            minute_dir,
+    else:
+        failure_message = _min_camera_requirement_failure(
+            camera_dirs, health_grade, camera_selection
         )
+        if failure_message:
+            _add_failure(trip_report, failure_message, minute_dir)
 
     if output.minute.mapping_file:
         if not mapping_path.exists():
@@ -820,7 +957,7 @@ def _validate_minute_dir(
     raw_sei_camera_count = 0
     camera_contexts: list[tuple[Path, bool]] = []
     for camera_dir in camera_dirs:
-        has_sei = _validate_camera_dir(report, trip_report, camera_dir, output)
+        has_sei = _validate_camera_dir(report, trip_report, camera_dir, output, health_grade)
         camera_contexts.append((camera_dir, has_sei))
         raw_sei_camera_count += int(has_sei)
 
@@ -868,6 +1005,7 @@ def _validate_camera_dir(
     trip_report: TripReport,
     camera_dir: Path,
     output: DatasetOutput,
+    health_grade: int = 500,
 ) -> bool:
     nested_dirs = [child for child in camera_dir.iterdir() if child.is_dir()]
     for nested_dir in nested_dirs:
@@ -917,7 +1055,7 @@ def _validate_camera_dir(
         _validate_non_empty_file(trip_report, link_file)
 
     telemetry_csv_path: Path | None = None
-    if output.footage.csv is not None:
+    if output.footage.csv is not None and health_grade != 0:
         telemetry_csv_path = _pick_single_file(
             trip_report,
             telemetry_csv_files,
@@ -935,7 +1073,7 @@ def _validate_camera_dir(
             )
 
     telemetry_mcap_path: Path | None = None
-    if output.footage.mcap is not None:
+    if output.footage.mcap is not None and health_grade != 0:
         telemetry_mcap_path = _pick_single_file(
             trip_report,
             telemetry_mcap_files,

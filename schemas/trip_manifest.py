@@ -25,7 +25,7 @@ class CameraItem(BaseModel):
     metadata_file_name: str | None = None
     camera_type: str | None = None
     camera: SignedFile
-    telemetry: SignedFile
+    telemetry: SignedFile | None = None
     sei: SignedFile | None = None
 
 
@@ -46,6 +46,7 @@ class MinuteManifest(BaseModel):
 class TripManifest(BaseModel):
     trip_id: str
     sub_trip: int
+    health_grade: int = 500
     version: str | None = None
     country: str | None = None
     state: str | None = None
