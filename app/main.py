@@ -8,7 +8,7 @@ import sys
 from datetime import UTC, datetime
 from multiprocessing import Process, Queue
 from pathlib import Path
-from queue import Empty
+from queue import Full
 
 from schemas import DatasetOutput
 from schemas.dataset_request import DatasetRequest
@@ -33,6 +33,15 @@ DATASET_REQUEST_FILENAME = "dataset_request.json"
 LOGS_DIR = Path("logs")
 STATE_DIR = Path("state")
 REGISTRY_FILE = STATE_DIR / "output_dirs.json"
+
+# Task queue depth. Deliberately bounded and fed while the workers run, never filled
+# up front: `Queue()` only *looks* unbounded — it is capped at the platform's
+# SEM_VALUE_MAX (2**31-1 on Linux, but **32767 on macOS**), so pre-loading every trip
+# blocks forever on the 32768th put on macOS for any dataset bigger than that, before
+# a single worker has been started. A small window also keeps memory flat.
+TASK_QUEUE_MAXSIZE = 1000
+# How long a blocked put waits before re-checking that workers are still alive.
+FEED_POLL_SECONDS = 1.0
 
 
 def _safe_name(value: str) -> str:
@@ -176,10 +185,13 @@ def _trip_worker(
 ) -> None:
     reporter = Reporter(status_queue)
     while True:
-        try:
-            trip_id, sub_trip, health_grade = task_queue.get_nowait()
-        except Empty:
+        # Blocking get + a None sentinel per worker: `get_nowait` raced the parent's
+        # feeder thread, so a worker saw Empty on a queue that still held thousands of
+        # trips and exited — most workers died on startup and trips were skipped.
+        task = task_queue.get()
+        if task is None:
             break
+        trip_id, sub_trip, health_grade = task
         process_trip(
             api_key,
             dataset_id,
@@ -192,6 +204,37 @@ def _trip_worker(
             s3_target=s3_target,
             health_grade=health_grade,
         )
+
+
+def _feed_queue(
+    task_queue: Queue,
+    trips: list[tuple[str, int, int]],
+    workers: list[Process],
+) -> bool:
+    """Feed ``trips`` then one ``None`` sentinel per worker onto a bounded queue.
+
+    Call this only AFTER the workers are running — a bounded queue blocks on ``put``
+    once full, so with no consumer it would never return. Returns ``False`` (and logs)
+    if every worker died while the queue was full, instead of blocking forever.
+    """
+    items: list[tuple[str, int, int] | None] = [*trips, *([None] * len(workers))]
+    for index, item in enumerate(items):
+        while True:
+            try:
+                task_queue.put(item, timeout=FEED_POLL_SECONDS)
+                break
+            except Full:
+                if not any(worker.is_alive() for worker in workers):
+                    logger.error(
+                        "All %d worker(s) exited early; %d of %d queue item(s) were "
+                        "never handed out. Remaining trips stay pending for the next "
+                        "pass or run.",
+                        len(workers),
+                        len(items) - index,
+                        len(items),
+                    )
+                    return False
+    return True
 
 
 def _run_pass(
@@ -209,10 +252,8 @@ def _run_pass(
     failure_log: Path,
 ) -> None:
     """Fork workers over ``trips``, running a single ledger writer in the parent."""
-    task_queue: Queue = Queue()
+    task_queue: Queue = Queue(maxsize=TASK_QUEUE_MAXSIZE)
     status_queue: Queue = Queue()
-    for trip in trips:
-        task_queue.put(trip)
 
     workers = [
         Process(
@@ -240,6 +281,9 @@ def _run_pass(
     writer = LedgerWriter(conn, status_queue, total_trips=total_trips)
     writer.attach_failure_log(failure_log)
     writer.start()
+
+    # Feed last: the queue is bounded, so the workers must already be draining it.
+    _feed_queue(task_queue, trips, workers)
 
     for worker in workers:
         worker.join()
