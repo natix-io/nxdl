@@ -142,6 +142,17 @@ class FootageOutput(BaseModel):
     sei: FootageSEIFormat | None = None
     fused_sei: FootageSEIFormat | None = None
 
+    def needs_telemetry(self) -> bool:
+        """Whether the per-camera telemetry CSV has to be fetched at all.
+
+        The delivered telemetry CSV is the downloaded file itself, but EXIF embedding
+        and the footage MCAP are also derived from its frames — so it's needed when
+        any of the three is on, and pure dead weight when none is. Single source of
+        truth for the download step (app.trip_downloader), the formatting step
+        (app.ds_formatter) and the expected-files list (app.manifest_coverage).
+        """
+        return self.csv is not None or self.mcap is not None or self.embed_exif
+
 
 class MinuteOutput(BaseModel):
     mapping_file: bool = False

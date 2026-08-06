@@ -70,6 +70,15 @@ def format_ds(trip_manifest: TripManifest, trip_dir: Path, output: DatasetOutput
             telemetry_path = build_camera_file_path(
                 camera_dir, camera.telemetry.presigned_url,
             )
+
+            # Nothing to read: needs_telemetry() is what gated the download in
+            # app.trip_downloader._iter_trip_tasks, so no file was fetched. Still run
+            # the CSV-disabled cleanup, which is idempotent — it catches a telemetry
+            # CSV left in a resumed cache dir by an earlier CSV-enabled run.
+            if not output.footage.needs_telemetry():
+                _handle_footage_csv_disabled(telemetry_path)
+                continue
+
             if not telemetry_path.exists():
                 raise Exception(f"Telemetry file not found: {telemetry_path}")
 
@@ -86,6 +95,10 @@ def format_ds(trip_manifest: TripManifest, trip_dir: Path, output: DatasetOutput
                 _handle_footage_csv_format(telemetry_path, frames, csv_fmt)
             if mcap_enabled:
                 _handle_footage_mcap_format(telemetry_path, frames, timezone, mcap_fmt)
+            if not csv_enabled:
+                # Downloaded only because EXIF/MCAP need its frames — drop it now that
+                # they're done, the same way fixed_metadata.csv is dropped.
+                _handle_footage_csv_disabled(telemetry_path)
         if write_mapping:
             _handle_minute_mapping_file(minute_dir, minute)
 
@@ -239,6 +252,14 @@ def _handle_footage_csv_format(
         "Rewrote %s with %d rows in '%s' format",
         telemetry_path, len(rows), footage_csv_format.value,
     )
+
+
+def _handle_footage_csv_disabled(telemetry_path: Path) -> None:
+    """Delete a downloaded telemetry CSV when footage CSV output is disabled."""
+    if not telemetry_path.exists():
+        return
+    telemetry_path.unlink()
+    logger.info("Deleted telemetry CSV (footage.csv disabled): %s", telemetry_path)
 
 
 def _handle_footage_mcap_format(

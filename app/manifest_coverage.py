@@ -93,7 +93,14 @@ def build_expected_trip_files(
             )
             expected.append(video_path.relative_to(trip_root))
 
-            if trip_manifest.health_grade != 0 and camera.telemetry is not None:
+            # Only the CSV format keeps the telemetry file in the delivered dataset:
+            # with footage.csv disabled it is either never downloaded or deleted after
+            # EXIF/MCAP consume it (see app.ds_formatter), so it must not be expected.
+            if (
+                trip_manifest.health_grade != 0
+                and camera.telemetry is not None
+                and output.footage.csv is not None
+            ):
                 telemetry_path = build_camera_file_path(
                     camera_dir, camera.telemetry.presigned_url
                 )

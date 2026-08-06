@@ -150,7 +150,11 @@ def _iter_trip_tasks(
                     _DownloadTask("video", camera.camera.presigned_url, camera_path)
                 )
 
-            if manifest.health_grade != 0 and camera.telemetry is not None:
+            if (
+                manifest.health_grade != 0
+                and camera.telemetry is not None
+                and output.footage.needs_telemetry()
+            ):
                 telemetry_path = build_camera_file_path(
                     camera_dir, camera.telemetry.presigned_url
                 )
