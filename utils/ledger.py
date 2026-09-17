@@ -29,6 +29,7 @@ rendered without a directory suffix.
 from __future__ import annotations
 
 import logging
+import re
 import sqlite3
 import threading
 import time
@@ -43,6 +44,14 @@ TRIP_COMPLETE = "complete"
 TRIP_PARTIAL = "partial"
 TRIP_FAILED = "failed"
 TRIP_IN_PROGRESS = "in_progress"
+# Everything available was downloaded, but some files are still being restored
+# from S3 Deep Archive; the trip is held in the cache until a later run.
+TRIP_PENDING_RESTORE = "pending_restore"
+# Some files sit in S3 Deep Archive and the dataset does not (currently)
+# request restores. The trip is held in the cache and skipped for the rest of
+# the run; a future run re-checks it, because the dataset may have been
+# switched to request_restore=true server-side in the meantime.
+TRIP_ARCHIVED = "archived"
 
 # Bumped whenever the table shape changes. A DB written by an older version is
 # reset rather than migrated — see `connect`.
@@ -200,6 +209,98 @@ def completed_trip_keys(conn: sqlite3.Connection) -> set[tuple[str, int, int]]:
     return {(row[0], int(row[1]), int(row[2])) for row in rows}
 
 
+def pending_restore_trip_keys(conn: sqlite3.Connection) -> set[tuple[str, int, int]]:
+    """Keys held back by a Deep-Archive restore — excluded from in-run retry passes.
+
+    A restore takes hours (~12h standard / ~48h bulk tier), so re-fetching the
+    manifest seconds later cannot help. The trips are NOT complete, so a future
+    run of the same command re-enqueues and finishes them.
+    """
+    rows = conn.execute(
+        f"SELECT trip_id, sub_trip, health_grade FROM trips WHERE status = '{TRIP_PENDING_RESTORE}'"
+    ).fetchall()
+    return {(row[0], int(row[1]), int(row[2])) for row in rows}
+
+
+def archived_trip_keys(conn: sqlite3.Connection) -> set[tuple[str, int, int]]:
+    """Keys held back by archived (restore-not-requested) files.
+
+    Excluded from IN-RUN retry passes only: the verdict changes when the dataset
+    is edited server-side (request_restore flipped to true), never within a run.
+    The trips are NOT complete, so a future run of the same command re-enqueues
+    them and re-fetches their manifests.
+    """
+    rows = conn.execute(
+        f"SELECT trip_id, sub_trip, health_grade FROM trips WHERE status = '{TRIP_ARCHIVED}'"
+    ).fetchall()
+    return {(row[0], int(row[1]), int(row[2])) for row in rows}
+
+
+# Written by pending_restore_message, parsed back by pending_restore_stats — keep in sync.
+_RESTORE_FILES_RE = re.compile(r"^(\d+) file")
+_RESTORE_ETA_RE = re.compile(r"available_at_ms=(\d+)")
+
+
+def pending_restore_message(files: int, available_at_ms: int | None) -> str:
+    """The trip-row ``error_message`` for a pending_restore trip."""
+    message = f"{files} file(s) awaiting archive restore"
+    if available_at_ms is not None:
+        message += f"; available_at_ms={available_at_ms}"
+    return message
+
+
+def archived_message(files: int) -> str:
+    """The trip-row ``error_message`` for an archived trip."""
+    return (
+        f"{files} file(s) in Deep Archive; restore not requested for this dataset "
+        "(settings.request_restore=false)"
+    )
+
+
+def archived_stats(
+    conn: sqlite3.Connection, in_scope: set[tuple[str, int, int]]
+) -> tuple[int, int]:
+    """``(trips, files)`` across in-scope archived rows."""
+    rows = conn.execute(
+        "SELECT trip_id, sub_trip, health_grade, error_message FROM trips "
+        f"WHERE status = '{TRIP_ARCHIVED}'"
+    ).fetchall()
+    trips = 0
+    files = 0
+    for trip_id, sub_trip, health_grade, message in rows:
+        if (trip_id, int(sub_trip), int(health_grade)) not in in_scope:
+            continue
+        trips += 1
+        files_match = _RESTORE_FILES_RE.match(message or "")
+        files += int(files_match.group(1)) if files_match else 1
+    return trips, files
+
+
+def pending_restore_stats(
+    conn: sqlite3.Connection, in_scope: set[tuple[str, int, int]]
+) -> tuple[int, int, int | None]:
+    """``(trips, files, max_available_at_ms)`` across in-scope pending_restore rows."""
+    rows = conn.execute(
+        "SELECT trip_id, sub_trip, health_grade, error_message FROM trips "
+        f"WHERE status = '{TRIP_PENDING_RESTORE}'"
+    ).fetchall()
+    trips = 0
+    files = 0
+    max_eta: int | None = None
+    for trip_id, sub_trip, health_grade, message in rows:
+        if (trip_id, int(sub_trip), int(health_grade)) not in in_scope:
+            continue
+        trips += 1
+        files_match = _RESTORE_FILES_RE.match(message or "")
+        files += int(files_match.group(1)) if files_match else 1
+        eta_match = _RESTORE_ETA_RE.search(message or "")
+        if eta_match:
+            eta = int(eta_match.group(1))
+            if max_eta is None or eta > max_eta:
+                max_eta = eta
+    return trips, files, max_eta
+
+
 class LedgerWriter(threading.Thread):
     """Parent-side single writer: drains the event queue into SQLite and renders progress.
 
@@ -351,13 +452,15 @@ class LedgerWriter(threading.Thread):
         )
         done = trip_counts.get(TRIP_COMPLETE, 0)
         logger.info(
-            "PROGRESS trips %d/%d (complete=%d partial=%d failed=%d in_progress=%d) | "
-            "files dl=%d up=%d failed=%d",
+            "PROGRESS trips %d/%d (complete=%d partial=%d failed=%d pending_restore=%d "
+            "archived=%d in_progress=%d) | files dl=%d up=%d failed=%d",
             done,
             self._total,
             done,
             trip_counts.get(TRIP_PARTIAL, 0),
             trip_counts.get(TRIP_FAILED, 0),
+            trip_counts.get(TRIP_PENDING_RESTORE, 0),
+            trip_counts.get(TRIP_ARCHIVED, 0),
             trip_counts.get(TRIP_IN_PROGRESS, 0),
             file_counts.get("downloaded", 0),
             file_counts.get("uploaded", 0),

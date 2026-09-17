@@ -1,6 +1,7 @@
 import logging
 import os
 import shutil
+from dataclasses import dataclass
 from pathlib import Path
 import httpx
 
@@ -28,11 +29,15 @@ from app.validation import validate_trip
 from utils.download import download_file_with_retry
 from utils.http_retry import get_with_retry
 from utils.ledger import (
+    TRIP_ARCHIVED,
     TRIP_COMPLETE,
     TRIP_FAILED,
     TRIP_IN_PROGRESS,
     TRIP_PARTIAL,
+    TRIP_PENDING_RESTORE,
     Reporter,
+    archived_message,
+    pending_restore_message,
     present_keys_cover,
 )
 from utils.s3_uploader import upload_trip_atomic
@@ -106,29 +111,61 @@ class _DownloadTask:
         self.is_link = is_link
 
 
+@dataclass
+class _PendingRestore:
+    """Files the manifest withholds because they sit in S3 Deep Archive.
+
+    Two categories: ``files`` are restoring (link comes after the restore
+    completes) and ``archived`` files will never come — the dataset was created
+    without ``settings.request_restore``.
+    """
+
+    files: int = 0
+    max_available_at: int | None = None  # epoch ms; None when no ETA is known
+    archived: int = 0
+
+    def add(self, available_at: int | None) -> None:
+        self.files += 1
+        if available_at is not None and (
+            self.max_available_at is None or available_at > self.max_available_at
+        ):
+            self.max_available_at = available_at
+
+    def add_archived(self) -> None:
+        self.archived += 1
+
+
 def _iter_trip_tasks(
     trip_dir: Path, manifest: TripManifest, output: DatasetOutput
-) -> list[_DownloadTask]:
-    """Build the list of files to fetch for a trip, mirroring the manifest structure."""
+) -> tuple[list[_DownloadTask], _PendingRestore]:
+    """Build the list of files to fetch for a trip, mirroring the manifest structure.
+
+    Files still restoring from Deep Archive have no link yet — they yield no task
+    and are tallied in the returned ``_PendingRestore`` instead, so the caller can
+    hold the trip until a later run re-fetches the manifest and backfills them.
+    """
     timezone = _get_trip_timezone(manifest)
     tasks: list[_DownloadTask] = []
+    pending = _PendingRestore()
 
     for minute in manifest.minutes:
         minute_dir = build_minute_directory_path(
             trip_dir, minute.minute_epoch, timezone
         )
-        if (
-            output.footage.fused_sei is not None
-            and getattr(minute, "fused_sei", None) is not None
-        ):
-            fused_sei_path = build_fused_sei_path(
-                minute_dir, minute.minute_epoch, timezone
-            )
-            tasks.append(
-                _DownloadTask(
-                    "fused_sei", minute.fused_sei.presigned_url, fused_sei_path
+        if output.footage.fused_sei is not None:
+            if minute.fused_sei_status == "archived":
+                pending.add_archived()
+            elif minute.fused_sei_status == "restoring":
+                pending.add(minute.fused_sei_available_at)
+            elif getattr(minute, "fused_sei", None) is not None:
+                fused_sei_path = build_fused_sei_path(
+                    minute_dir, minute.minute_epoch, timezone
                 )
-            )
+                tasks.append(
+                    _DownloadTask(
+                        "fused_sei", minute.fused_sei.presigned_url, fused_sei_path
+                    )
+                )
         for camera in minute.cameras:
             if not is_camera_allowed(camera.camera_type):
                 continue
@@ -138,7 +175,11 @@ def _iter_trip_tasks(
             camera_path = build_camera_video_path(
                 camera_dir, camera.camera_type, minute.minute_epoch, timezone
             )
-            if settings.dry_mode:
+            if camera.video_status == "archived":
+                pending.add_archived()
+            elif camera.video_status == "restoring" or camera.camera is None:
+                pending.add(camera.video_available_at)
+            elif settings.dry_mode:
                 link_path = camera_path.parent / (camera_path.name + ".link")
                 tasks.append(
                     _DownloadTask(
@@ -164,10 +205,17 @@ def _iter_trip_tasks(
                     )
                 )
 
-            if output.footage.sei is not None and camera.sei is not None:
-                sei_path = camera_path.with_suffix(".sei")
-                sei_path = sei_path.with_name(sei_path.name + ".csv")
-                tasks.append(_DownloadTask("sei", camera.sei.presigned_url, sei_path))
+            if output.footage.sei is not None:
+                if camera.sei_status == "archived":
+                    pending.add_archived()
+                elif camera.sei_status == "restoring":
+                    pending.add(camera.sei_available_at)
+                elif camera.sei is not None:
+                    sei_path = camera_path.with_suffix(".sei")
+                    sei_path = sei_path.with_name(sei_path.name + ".csv")
+                    tasks.append(
+                        _DownloadTask("sei", camera.sei.presigned_url, sei_path)
+                    )
 
     for feature_name in (
         "fixed_metadata",
@@ -181,7 +229,7 @@ def _iter_trip_tasks(
         feature_path = build_feature_file_path(trip_dir, feature_name)
         tasks.append(_DownloadTask("feature", feature.presigned_url, feature_path))
 
-    return tasks
+    return tasks, pending
 
 
 def _write_link_file(presigned_url: str, link_path: Path) -> None:
@@ -247,6 +295,7 @@ def _record_download_failures(
     health_grade: int,
     cache_trip_dir: Path,
     failures: list[tuple[_DownloadTask, str]],
+    restoring_files: int = 0,
 ) -> None:
     """Persist per-file failure rows + a detailed trip PARTIAL message.
 
@@ -275,13 +324,16 @@ def _record_download_failures(
     summary = "; ".join(details[:_MAX_ERROR_DETAIL_ITEMS])
     if len(details) > _MAX_ERROR_DETAIL_ITEMS:
         summary += f" (+{len(details) - _MAX_ERROR_DETAIL_ITEMS} more)"
+    message = f"{len(failures)} file(s) failed to download: {summary}"
+    if restoring_files:
+        message += f"; {restoring_files} file(s) awaiting archive restore"
     reporter.trip(
         trip_id,
         sub_trip,
         health_grade,
         TRIP_PARTIAL,
         error_stage="download",
-        error_message=f"{len(failures)} file(s) failed to download: {summary}",
+        error_message=message,
     )
     logger.error(
         "Trip %s_%d: %d file(s) failed to download; kept cache for retry: %s",
@@ -381,24 +433,90 @@ def process_trip(
         settings.cache_dir, trip_id, sub_trip, health_grade
     )
     try:
-        tasks = _iter_trip_tasks(cache_trip_dir, trip_manifest, output)
+        tasks, restoring = _iter_trip_tasks(cache_trip_dir, trip_manifest, output)
         failures = _download_trip_tasks(tasks)
         if failures:
-            # Retry once with a fresh manifest in case presigned URLs expired.
+            # Retry once with a fresh manifest in case presigned URLs expired. The
+            # fresh manifest also re-checks Deep-Archive state, so `restoring` is
+            # replaced with the server's current view.
             try:
                 trip_manifest = get_trip_manifest(
                     api_key, dataset_id, trip_id, sub_trip, health_grade
                 )
-                tasks = _iter_trip_tasks(cache_trip_dir, trip_manifest, output)
+                tasks, restoring = _iter_trip_tasks(
+                    cache_trip_dir, trip_manifest, output
+                )
                 failures = _download_trip_tasks(tasks)
             except Exception:
                 logger.exception(
                     "Manifest refresh failed for trip %s_%d", trip_id, sub_trip
                 )
 
+        # A file can be archived between the manifest check and the download — S3
+        # then answers InvalidObjectState. Count it as restoring (the next manifest
+        # fetch requests the restore server-side), not as a hard failure.
+        still_failed = []
+        for task, message in failures:
+            if "InvalidObjectState" in message:
+                restoring.add(None)
+            else:
+                still_failed.append((task, message))
+        failures = still_failed
+
         if failures:
             _record_download_failures(
-                reporter, trip_id, sub_trip, health_grade, cache_trip_dir, failures
+                reporter,
+                trip_id,
+                sub_trip,
+                health_grade,
+                cache_trip_dir,
+                failures,
+                restoring_files=restoring.files,
+            )
+            return
+
+        if restoring.archived > 0:
+            # No restore is coming for these files while the dataset opts out of
+            # restores. Held in cache and skipped for the rest of the run; a
+            # future run re-checks (the dataset may get request_restore=true).
+            message = archived_message(restoring.archived)
+            if restoring.files > 0:
+                message += f" (+{restoring.files} file(s) awaiting archive restore)"
+            reporter.trip(
+                trip_id,
+                sub_trip,
+                health_grade,
+                TRIP_ARCHIVED,
+                error_stage="archived",
+                error_message=message,
+            )
+            logger.info(
+                "Trip %s_%d: %s; everything available is downloaded — trip held in "
+                "the cache until a later run finds the files downloadable",
+                trip_id,
+                sub_trip,
+                message,
+            )
+            return
+
+        if restoring.files > 0:
+            message = pending_restore_message(
+                restoring.files, restoring.max_available_at
+            )
+            reporter.trip(
+                trip_id,
+                sub_trip,
+                health_grade,
+                TRIP_PENDING_RESTORE,
+                error_stage="pending_restore",
+                error_message=message,
+            )
+            logger.info(
+                "Trip %s_%d: %s; everything available is downloaded — trip held in "
+                "the cache until a later run completes it",
+                trip_id,
+                sub_trip,
+                message,
             )
             return
 

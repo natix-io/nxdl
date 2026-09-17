@@ -1,4 +1,5 @@
 from enum import StrEnum
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -69,6 +70,8 @@ class DatasetSettings(BaseModel):
     client_ids: list[str] | None = Field(default_factory=list)
     trip_label_threshold_percent: int = Field(default=50)
     anonymize: bool = Field(default=False)
+    # S3 restore speed for Deep-Archive files: "standard" ~12h, "bulk" ~48h.
+    restore_tier: Literal["standard", "bulk"] = Field(default="bulk")
 
 
 class Region(BaseModel):

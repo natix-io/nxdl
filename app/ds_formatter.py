@@ -41,9 +41,8 @@ def format_ds(trip_manifest: TripManifest, trip_dir: Path, output: DatasetOutput
     if output.trip_insight is not None:
         _build_trip_insight(trip_manifest, trip_dir, output.trip_insight)
 
-    if trip is None:
-        return
-
+    # `trip` is None only when nothing consumes it (see _needs_fixed_metadata), which
+    # includes EXIF embedding — so the per-camera pass below stays valid either way.
     embed_exif = output.footage.embed_exif
     # Grade 0 is video-only, categorically — no telemetry CSV/MCAP is ever
     # produced for it, even on a minute that happens to have telemetry.
@@ -108,15 +107,32 @@ def format_ds(trip_manifest: TripManifest, trip_dir: Path, output: DatasetOutput
 # ---------------------------------------------------------------------------
 
 
+def _needs_fixed_metadata(output: DatasetOutput) -> bool:
+    """Whether a trip's fixed_metadata feature file has to be read at all.
+
+    It backs the fixed_metadata.{csv,json,mcap} outputs and the XMP that EXIF embedding
+    writes. With all of those off the service leaves the fixed_metadata link out of the
+    trip manifest (it keys the manifest's feature links on the request's output block),
+    so the file is never downloaded and a trip has to format fine without it.
+    """
+    return output.fixed_metadata is not None or output.footage.embed_exif
+
+
 def _format_fixed_metadata(
     trip_manifest: TripManifest, trip_dir: Path, output: DatasetOutput
 ) -> TripMetadata | None:
-    """Build, parse, convert, and optionally clean up the fixed_metadata CSV for a trip."""
-    csv_path = build_fixed_metadata_path(trip_dir)
+    """Build, parse, convert, and optionally clean up the fixed_metadata CSV for a trip.
+
+    Returns None when the request needs no fixed metadata, in which case nothing was
+    downloaded and no trip-metadata file is written.
+    """
     fixed_metadata = _load_fixed_metadata(trip_dir)
     if fixed_metadata is None:
-        raise ValueError("Fixed metadata is required for trip manifest")
+        if _needs_fixed_metadata(output):
+            raise ValueError("Fixed metadata is required for trip manifest")
+        return None
 
+    csv_path = build_fixed_metadata_path(trip_dir)
     vehicle_hw_version = getattr(trip_manifest, "vehicle_hw_version", None)
     trip = TripMetadata.from_manifest(trip_manifest.trip_id, 1, fixed_metadata, vehicle_hw_version)
     trip.save_to_csv_file(csv_path)

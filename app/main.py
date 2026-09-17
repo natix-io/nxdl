@@ -92,6 +92,41 @@ def _filter_pending_trips(
     return [trip for trip in all_trips if trip not in done]
 
 
+def _filter_retryable_trips(
+    pending: list[tuple[str, int, int]],
+    waiting: set[tuple[str, int, int]],
+) -> list[tuple[str, int, int]]:
+    """Drop trips whose only blocker is a Deep-Archive restore.
+
+    A restore takes hours (~12h standard / ~48h bulk tier), so an in-run retry
+    pass seconds later cannot help them and would only hammer the manifest
+    endpoint. They are not complete, so a future run re-enqueues them.
+    """
+    return [trip for trip in pending if trip not in waiting]
+
+
+_RESTORE_TIER_ETA_HINT = {"standard": "~12h", "bulk": "~48h"}
+
+
+def _pending_restore_message(
+    trips: int, files: int, max_eta_ms: int | None, restore_tier: str
+) -> str:
+    """End-of-run summary for files still being restored from S3 Deep Archive.
+
+    Deliberately non-technical: the person running the client just needs to know
+    part of the dataset is still being prepared and when to re-run.
+    """
+    if max_eta_ms is not None:
+        when = datetime.fromtimestamp(max_eta_ms / 1000).astimezone()
+        retry = f"after ~{when.strftime('%Y-%m-%d %H:%M %Z')}"
+    else:
+        retry = f"in {_RESTORE_TIER_ETA_HINT.get(restore_tier, '~48h')}"
+    return (
+        f"{files} file(s) across {trips} trip(s) are still being prepared and "
+        f"will take a while. Re-run the same command {retry} to download them."
+    )
+
+
 def _setup_logging(stamp: str) -> Path:
     """Terminal shows progress + milestones (INFO); a per-run file gets full detail (DEBUG).
 
@@ -345,9 +380,8 @@ def main() -> None:
         )
         sys.exit(1)
 
-    dataset_output: DatasetOutput = DatasetRequest.model_validate(
-        dataset_request.request
-    ).output
+    dataset_request_model = DatasetRequest.model_validate(dataset_request.request)
+    dataset_output: DatasetOutput = dataset_request_model.output
 
     if not ds_manifest.trips:
         logger.info("No trips found for dataset %s", dataset_id)
@@ -408,7 +442,9 @@ def main() -> None:
     # complete rows for trips a TRIPS_FILE subset excluded.
     in_scope = set(all_trips)
 
-    # Resume: skip trips already marked complete in the ledger.
+    # Resume: skip trips already marked complete in the ledger. Archived trips
+    # are NOT skipped: the dataset may have been switched to request_restore=true
+    # since the last run, so a fresh run re-fetches their manifests.
     conn = connect(db_path)
     done = ledger.completed_trip_keys(conn)
     conn.close()
@@ -441,19 +477,26 @@ def main() -> None:
 
         conn = connect(db_path)
         done = ledger.completed_trip_keys(conn)
+        # Both hold-states are excluded from IN-RUN retries only: a restore takes
+        # hours, and an archived verdict only changes when the dataset is edited
+        # server-side — re-fetching seconds later helps neither. A future run of
+        # the same command re-enqueues both.
+        waiting = ledger.pending_restore_trip_keys(conn) | ledger.archived_trip_keys(conn)
         conn.close()
         pending = _filter_pending_trips(all_trips, done)
-        if not pending:
+        retryable = _filter_retryable_trips(pending, waiting)
+        if not retryable:
             break
         if pass_num >= settings.max_retry_passes:
             logger.warning(
                 "%d trip(s) still incomplete after %d retry pass(es); see %s",
-                len(pending),
+                len(retryable),
                 settings.max_retry_passes,
                 failure_log,
             )
             break
         pass_num += 1
+        pending = retryable
 
     # Upload the saved request last (never before forking a worker that creates a
     # boto3 client — keeps the client per-worker and fork-safe).
@@ -471,6 +514,32 @@ def main() -> None:
     logger.info(
         "Finished dataset %s: %d/%d trip(s) complete", dataset_id, completed, total
     )
+
+    # Files in S3 Deep Archive can't be downloaded until their restore completes;
+    # tell the user when to re-run. Last thing on screen on purpose.
+    conn = connect(db_path)
+    restore_trips, restore_files, max_eta_ms = ledger.pending_restore_stats(
+        conn, in_scope
+    )
+    archived_trips, archived_files = ledger.archived_stats(conn, in_scope)
+    conn.close()
+    if restore_trips:
+        logger.warning(
+            _pending_restore_message(
+                restore_trips,
+                restore_files,
+                max_eta_ms,
+                dataset_request_model.settings.restore_tier,
+            )
+        )
+    if archived_trips:
+        logger.warning(
+            "%d trip(s) skipped: %d file(s) are archived and not available for "
+            "download in this dataset. If you need these files, please contact "
+            "the NATIX team to have them included, then re-run the same command.",
+            archived_trips,
+            archived_files,
+        )
 
 
 if __name__ == "__main__":

@@ -24,9 +24,19 @@ class FixedMetadata(BaseModel):
 class CameraItem(BaseModel):
     metadata_file_name: str | None = None
     camera_type: str | None = None
-    camera: SignedFile
+    camera: SignedFile | None = None
     telemetry: SignedFile | None = None
     sei: SignedFile | None = None
+    # "available" | "restoring" | "archived". The link is withheld (None) while
+    # the file is being restored from S3 Deep Archive; *_available_at is an
+    # epoch-ms ETA set only while restoring. "archived" means the file sits in
+    # Deep Archive and the dataset did not request restores — no link, no ETA,
+    # nothing coming. A None link with "available" keeps the legacy meaning:
+    # the file simply doesn't exist.
+    video_status: str = "available"
+    video_available_at: int | None = None
+    sei_status: str = "available"
+    sei_available_at: int | None = None
 
 
 class MinuteManifest(BaseModel):
@@ -34,6 +44,8 @@ class MinuteManifest(BaseModel):
     minute_epoch: int | None = None
     minute_epoch_local: int | None = None
     fused_sei: SignedFile | None = None
+    fused_sei_status: str = "available"
+    fused_sei_available_at: int | None = None
     cameras: list[CameraItem] = Field(default_factory=list)
 
     def get_minute_key(self) -> str | None:

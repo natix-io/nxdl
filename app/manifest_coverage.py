@@ -26,8 +26,13 @@ class ManifestCoverageResult:
     note: str | None = None
     missing_files: list[str] = field(default_factory=list)
     missing_minutes: list[str] = field(default_factory=list)
-    # Trips in the dataset manifest that are entirely absent on disk/S3.
+    # Trips in the dataset manifest that are entirely absent on disk/S3, split by
+    # why: archived (Deep Archive, restore not requested — will never download),
+    # restoring (Deep Archive restore in flight — a later run completes them),
+    # or genuinely missing (the manifest offers everything, yet nothing landed).
     missing_trips: list[str] = field(default_factory=list)
+    archived_trips: list[str] = field(default_factory=list)
+    restoring_trips: list[str] = field(default_factory=list)
     trip_summaries: list[str] = field(default_factory=list)
     fetch_errors: list[str] = field(default_factory=list)
 
@@ -70,7 +75,13 @@ def build_expected_trip_files(
             trip_root, minute.minute_epoch, timezone
         )
 
-        if output.footage.fused_sei is not None and minute.fused_sei is not None:
+        # A restoring/archived file has its link withheld but exists server-side —
+        # keep it expected so neither the S3 fast-resume nor QA can call the trip
+        # complete.
+        if output.footage.fused_sei is not None and (
+            minute.fused_sei is not None
+            or minute.fused_sei_status in ("restoring", "archived")
+        ):
             expected.append(
                 build_fused_sei_path(
                     minute_dir, minute.minute_epoch, timezone
@@ -106,7 +117,9 @@ def build_expected_trip_files(
                 )
                 expected.append(telemetry_path.relative_to(trip_root))
 
-            if output.footage.sei is not None and camera.sei is not None:
+            if output.footage.sei is not None and (
+                camera.sei is not None or camera.sei_status in ("restoring", "archived")
+            ):
                 sei_path = video_path.with_suffix(".sei")
                 sei_path = sei_path.with_name(f"{sei_path.name}.csv")
                 expected.append(sei_path.relative_to(trip_root))
@@ -144,6 +157,8 @@ def collect_manifest_missing_files(
     missing_files: list[str] = []
     missing_minutes: list[str] = []
     missing_trips: list[str] = []
+    archived_trips: list[str] = []
+    restoring_trips: list[str] = []
     trip_summaries: list[str] = []
     fetch_errors: list[str] = []
 
@@ -207,9 +222,16 @@ def collect_manifest_missing_files(
 
         trip_dir = discovered_trips.get(trip_key)
         if trip_dir is None:
-            # The whole trip is absent — report it once as a missing trip instead of
-            # enumerating every expected file as "missing".
-            missing_trips.append(format_trip_key(trip_key))
+            # The whole trip is absent — report it once (classified by why the
+            # downloader held it) instead of enumerating every expected file as
+            # "missing".
+            statuses = _withheld_statuses(trip_manifest)
+            if "archived" in statuses:
+                archived_trips.append(format_trip_key(trip_key))
+            elif "restoring" in statuses:
+                restoring_trips.append(format_trip_key(trip_key))
+            else:
+                missing_trips.append(format_trip_key(trip_key))
             continue
 
         trip_rel = _relative_path(dataset_dir, trip_dir)
@@ -250,9 +272,22 @@ def collect_manifest_missing_files(
         missing_files=sorted(set(missing_files)),
         missing_minutes=sorted(set(missing_minutes)),
         missing_trips=sorted(set(missing_trips)),
+        archived_trips=sorted(set(archived_trips)),
+        restoring_trips=sorted(set(restoring_trips)),
         trip_summaries=sorted(trip_summaries),
         fetch_errors=fetch_errors,
     )
+
+
+def _withheld_statuses(trip_manifest: TripManifest) -> set[str]:
+    """All video/sei/fused-sei statuses the trip manifest reports."""
+    statuses: set[str] = set()
+    for minute in trip_manifest.minutes:
+        statuses.add(minute.fused_sei_status)
+        for camera in minute.cameras:
+            statuses.add(camera.video_status)
+            statuses.add(camera.sei_status)
+    return statuses
 
 
 def _is_link_path(relative_file: Path) -> bool:

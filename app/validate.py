@@ -403,6 +403,9 @@ def _render_report(
     if manifest_coverage is not None:
         write(f"- manifest_missing_files: {len(manifest_coverage.missing_files)}\n")
         write(f"- manifest_missing_minutes: {len(manifest_coverage.missing_minutes)}\n")
+        write(f"- manifest_missing_trips: {len(manifest_coverage.missing_trips)}\n")
+        write(f"- manifest_archived_trips: {len(manifest_coverage.archived_trips)}\n")
+        write(f"- manifest_restoring_trips: {len(manifest_coverage.restoring_trips)}\n")
     write(f"- exit_code: {_validation_exit_code(report, manifest_coverage)}\n")
     return buffer.getvalue()
 
@@ -499,6 +502,30 @@ def _write_manifest_trip_coverage(
         write("Manifest trip coverage\n")
         for summary in manifest_coverage.trip_summaries:
             write(f"- {summary}\n")
+        write("\n")
+
+    if manifest_coverage.archived_trips:
+        write(
+            "Archived trips (not available in this dataset — contact the NATIX "
+            "team if you need them, then re-run the download)\n"
+        )
+        for trip in manifest_coverage.archived_trips:
+            write(f"- {trip}\n")
+        write("\n")
+
+    if manifest_coverage.restoring_trips:
+        write(
+            "Trips not ready yet (still being prepared — re-run the download "
+            "later to complete them)\n"
+        )
+        for trip in manifest_coverage.restoring_trips:
+            write(f"- {trip}\n")
+        write("\n")
+
+    if manifest_coverage.missing_trips:
+        write("Missing trips (expected in the dataset, not downloaded)\n")
+        for trip in manifest_coverage.missing_trips:
+            write(f"- {trip}\n")
         write("\n")
 
     if manifest_coverage.missing_minutes:
