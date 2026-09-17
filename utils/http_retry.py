@@ -3,6 +3,8 @@ import time
 
 import httpx
 
+from utils.http_client import client
+
 logger = logging.getLogger(__name__)
 
 RETRYABLE_STATUS_CODES = frozenset({429, 502, 503, 504})
@@ -21,7 +23,7 @@ def get_with_retry(
 
     for attempt in range(max_retries + 1):
         try:
-            response = httpx.get(url, headers=headers, timeout=timeout)
+            response = client().get(url, headers=headers, timeout=timeout)
             if (
                 response.status_code in RETRYABLE_STATUS_CODES
                 and attempt < max_retries

@@ -24,6 +24,8 @@ from pathlib import Path
 
 import httpx
 
+from utils.http_client import client
+
 logger = logging.getLogger(__name__)
 
 RETRYABLE_STATUS_CODES = frozenset({429, 502, 503, 504})
@@ -104,7 +106,7 @@ def download_file_with_retry(
 
     for attempt in range(max_retries + 1):
         try:
-            with httpx.stream(
+            with client().stream(
                 "GET", url, timeout=timeout, follow_redirects=True
             ) as response:
                 if (
