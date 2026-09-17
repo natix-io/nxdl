@@ -87,3 +87,5 @@ The validator scans the local dataset folder and prints:
   sed -i 's/\r$//' install.sh run.sh validate.sh
   ```
 - **`Installation is missing. Please run ./install.sh first.`**: run `bash install.sh` before `./run.sh` or `./validate.sh`.
+- **`N file(s) across M trip(s) are still being prepared and will take a while.`**: part of the dataset sits in long-term storage and is being restored for you. The download itself is fine — re-run the exact same command after the time given in the message (roughly 12h, or ~48h for a bulk restore) and the client fetches only what is still missing. Everything already downloaded is kept.
+- **`N trip(s) skipped: M file(s) are archived and not available for download in this dataset.`**: those files are not being restored. Contact the NATIX team to have them included, then re-run the same command.
