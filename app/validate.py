@@ -100,6 +100,8 @@ def main() -> None:
     camera_selection = _apply_camera_selection(args.camera_selection)
     source = "--camera-selection" if args.camera_selection is not None else "settings"
     print(f"Camera selection: {camera_selection} (from {source})")
+    if settings.trips_file.strip():
+        print(f"Trip selection: {settings.trips_file} (TRIPS_FILE)")
 
     s3_context: S3ReportContext | None = None
     manifest_coverage: ManifestCoverageResult | None = None
@@ -115,11 +117,12 @@ def main() -> None:
             dataset_dir=args.dataset_dir,
             allowed_root_files=allowed_root_files,
             camera_selection=camera_selection,
+            workers=args.workers,
         )
         manifest_coverage = _collect_manifest_coverage(
             report,
             trip_filter=None,
-            max_trips=args.manifest_max_trips,
+            max_trips=args.manifest_max_trips or None,
             uploaded_only=args.manifest_uploaded_only,
         )
     _print_report(report, s3_context, manifest_coverage)
@@ -248,11 +251,12 @@ def _validate_on_s3(
         dataset_dir=root,
         allowed_root_files=frozenset(),
         camera_selection=_apply_camera_selection(args.camera_selection),
+        workers=args.workers,
     )
     manifest_coverage = _collect_manifest_coverage(
         report,
         trip_filter=context.expected_trips,
-        max_trips=args.manifest_max_trips,
+        max_trips=args.manifest_max_trips or None,
         uploaded_only=args.manifest_uploaded_only,
     )
     return report, context, manifest_coverage
@@ -384,6 +388,11 @@ def _render_report(
         elif manifest_coverage.trip_summaries:
             incomplete = len(manifest_coverage.trip_summaries)
             write(f"Manifest file coverage: {incomplete} incomplete trip(s)\n")
+        if manifest_coverage.sampled_trips is not None:
+            write(
+                "Missing-trip detection covers every trip; only the per-trip file "
+                "check is sampled.\n"
+            )
     write("\n")
 
     _write_base_stats(write, report)
@@ -703,11 +712,24 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--manifest-max-trips",
         type=int,
+        default=settings.manifest_file_sample,
+        metavar="N",
+        help=(
+            "Check only the first N downloaded trips file-by-file against their "
+            "manifests, instead of all of them; that check costs one API request "
+            "per trip. Off by default, because a sample cannot prove the dataset "
+            "is complete. Which trips are missing altogether is always reported "
+            "in full, whatever this is."
+        ),
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
         default=None,
         metavar="N",
         help=(
-            "Limit manifest file coverage to the first N trips (uploaded trips "
-            "first when combined with --manifest-uploaded-only)."
+            "Trips validated concurrently (default QA_WORKERS from the active "
+            ".env). QA is latency-bound on a network filesystem; 1 is serial."
         ),
     )
     parser.add_argument(
@@ -726,8 +748,9 @@ def _parse_args() -> argparse.Namespace:
         "--manifest-uploaded-only",
         action="store_true",
         help=(
-            "Limit manifest file coverage to trips that exist on disk/S3, "
-            "instead of every trip in the dataset manifest."
+            "Do not report trips that are missing altogether — only check the "
+            "files of trips already on disk/S3. Off by default: with it on, a "
+            "half-downloaded dataset can pass."
         ),
     )
     return parser.parse_args()

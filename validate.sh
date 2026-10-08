@@ -13,6 +13,10 @@ if [[ ! -x "${VENV_PYTHON}" ]]; then
     exit 1
 fi
 
+# Vendored tools (exiftool) are symlinked into the venv's bin; the venv is never
+# activated, so put it on PATH for the subprocess call in utils/exif_tools.py.
+export PATH="${SCRIPT_DIR}/.venv_natix/bin:${PATH}"
+
 if [[ ! -f "${SCRIPT_DIR}/.env.production" ]]; then
     echo "Missing .env.production. This package must include that file."
     exit 1
@@ -31,6 +35,8 @@ Optional:
                             all (default) | front | front_rear. Omit to use
                             CAMERA_SELECTION from .env.production; pass the same
                             value that was used for ./run.sh
+  --trips-file <path>       The same JSON trips file given to ./run.sh, so only
+                            the selected trips/minutes are expected
   -h, --help            Show this help and exit
 
 Any other arguments are passed through to the validator, e.g.:
@@ -54,6 +60,19 @@ while [[ $# -gt 0 ]]; do
                 exit 1
             fi
             export OUTPUT_DIR="$2"
+            shift 2
+            ;;
+        --trips-file=*)
+            export TRIPS_FILE="${1#*=}"
+            shift
+            ;;
+        --trips-file)
+            if [[ $# -lt 2 ]]; then
+                echo "Error: $1 requires a value." >&2
+                usage >&2
+                exit 1
+            fi
+            export TRIPS_FILE="$2"
             shift 2
             ;;
         -h|--help)

@@ -1,7 +1,8 @@
 """Parse a text file of ``<trip_id>_<sub_trip>[_<health_grade>]`` lines into trip keys.
 
-Used by the standalone S3 maintenance tools (e.g. ``delete_trips_from_s3.py``) and
-by ``app.main``'s optional ``TRIPS_FILE`` subset filter.
+Used by the standalone S3 maintenance tools (e.g. ``delete_trips_from_s3.py``).
+``app.main``'s ``TRIPS_FILE`` is a JSON file parsed by ``utils.trip_selection``
+instead; :func:`trip_matches` / :func:`format_trip_key` are shared by both.
 
 Note on ``_TRIP_LINE_RE``: this intentionally duplicates ``app.validation``'s
 ``TRIP_DIR_RE`` / ``parse_trip_dir_name`` (same non-greedy-trip_id, optional

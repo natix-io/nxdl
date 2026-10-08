@@ -1,3 +1,5 @@
+import hashlib
+import re
 import os
 from datetime import datetime
 from pathlib import Path
@@ -126,6 +128,36 @@ def build_feature_file_path(trip_dir: Path, feature_name: str) -> Path:
 
 def build_features_directory_path(trip_dir: Path) -> Path:
     return trip_dir / FEATURES_DIRNAME
+
+
+def safe_name(value: str) -> str:
+    """Filesystem-safe token from a dataset id (used in filenames and dir names)."""
+    return re.sub(r"[^A-Za-z0-9._-]", "_", value) or "dataset"
+
+
+def build_dataset_cache_path(
+    cache_base: Path,
+    dataset_id: str,
+    output_dir: Path | None = None,
+    *,
+    dry_mode: bool = False,
+    camera_selection: str = "",
+) -> Path:
+    """Cache root for one dataset, one output dir, one mode.
+
+    Scoped like the ledger, for the same reasons. Per dataset alone let two
+    instances share a subtree where either startup ``sweep_partial_files``
+    deleted the other's in-flight ``.part`` files. Mode is in the scope too: an
+    interrupted dry run leaves ``.mp4.link`` files, and an interrupted all-camera
+    run leaves REAR files, that a later real or front-only run would otherwise
+    publish alongside its own output.
+    """
+    name = safe_name(dataset_id)
+    if output_dir is not None:
+        mode = f"dry={int(bool(dry_mode))}\ncameras={camera_selection or 'all'}"
+        digest = hashlib.sha256(f"{output_dir}\n{mode}".encode()).hexdigest()[:16]
+        name = f"{name}__{digest}"
+    return cache_base / name
 
 
 def build_cache_trip_path(

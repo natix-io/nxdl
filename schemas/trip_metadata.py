@@ -305,7 +305,19 @@ class TripMetadata:
             },
         }
 
-    def save_to_mcap_file(self, mcap_path: str, format: TripMCAPFormat = TripMCAPFormat.default) -> None:
+    def save_to_mcap_file(
+        self,
+        mcap_path: str,
+        format: TripMCAPFormat = TripMCAPFormat.default,
+        log_time_ns: int = 0,
+    ) -> None:
+        """``log_time_ns`` is when the trip this metadata describes starts.
+
+        It belongs in the signature because this record carries no time of its
+        own, and a zero one drops out of every time-filtered read: a consumer
+        asking for messages after the epoch gets no calibration or context at
+        all. The caller knows the trip's start, so it supplies it.
+        """
         try:
             
             mcap_metadata = self._convert_to_mcap(format)
@@ -313,7 +325,14 @@ class TripMetadata:
             schema_name = "Metadata"
             topic_name = "Metadata"
             
-            generate_mcap_file(mcap_path, mcap_metadata, proto_schema, schema_name, topic_name)
+            generate_mcap_file(
+                mcap_path,
+                mcap_metadata,
+                proto_schema,
+                schema_name,
+                topic_name,
+                log_time_ns=log_time_ns,
+            )
             
         except Exception as e:
             logger.error(f"save_trip_to_mcap_file({mcap_path}): {e}")

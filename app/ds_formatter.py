@@ -17,13 +17,14 @@ from schemas.trip_manifest import FixedMetadata, MinuteManifest, CameraItem
 from schemas.trip_metadata import TripMetadata
 from utils.csv_helpers import parse_telemetry_csv
 from utils.exif_tools import extract_xmp_metadata, embed_xmp_into_video
-from utils.footage import save_to_mcap_file
+from utils.footage import delivered_time_ns, save_to_mcap_file
 from utils.safety_critical_events import public_name_for_internal
 from utils.path_helpers import (
     build_camera_directory_path, build_camera_file_path, build_camera_video_path,
     build_feature_file_path, build_fixed_metadata_path, build_minute_directory_path,
     build_trip_insight_path,
     get_camera_type,
+    get_minute_dir_name,
     is_camera_allowed,
 )
 from utils.settings import settings
@@ -52,6 +53,11 @@ def format_ds(trip_manifest: TripManifest, trip_dir: Path, output: DatasetOutput
     mcap_fmt = output.footage.mcap
     write_mapping = output.minute.mapping_file
     timezone = _get_timezone(trip_manifest)
+
+    # The earliest time the DELIVERED telemetry files will encode, gathered as
+    # the frames are parsed below (see utils.footage.delivered_time_ns), so that
+    # `app.regen` reads the same answer back from those files.
+    earliest_frame_ns: int | None = None
 
     for minute in trip_manifest.minutes:
         minute_dir = build_minute_directory_path(trip_dir, minute.minute_epoch, timezone)
@@ -82,6 +88,13 @@ def format_ds(trip_manifest: TripManifest, trip_dir: Path, output: DatasetOutput
                 raise Exception(f"Telemetry file not found: {telemetry_path}")
 
             frames: list[FrameData] = parse_telemetry_csv(telemetry_path)
+            first = delivered_time_ns(
+                frames, timezone, csv_fmt if csv_enabled else None, mcap_enabled
+            )
+            if first is not None:
+                earliest_frame_ns = (
+                    first if earliest_frame_ns is None else min(earliest_frame_ns, first)
+                )
 
             if embed_exif and not settings.dry_mode:
                 _handle_camera_exif(
@@ -100,6 +113,29 @@ def format_ds(trip_manifest: TripManifest, trip_dir: Path, output: DatasetOutput
                 _handle_footage_csv_disabled(telemetry_path)
         if write_mapping:
             _handle_minute_mapping_file(minute_dir, minute)
+
+    # After the loop, deliberately. The trip-level metadata record carries no time
+    # of its own and a zero one drops out of every time-filtered read, so it is
+    # stamped with the trip's earliest telemetry moment — the frames parsed above,
+    # which are what the delivered CSVs hold and what `app.regen` can read back.
+    # A trip with no telemetry at all (grade 0, or `footage.csv: null` with no
+    # MCAP either, so nothing was downloaded) falls back to the manifest's first
+    # minute: still a real time, still a function of the data, and the only one
+    # there is. Regeneration cannot see the manifest, so for those trips it has
+    # no time to give and says so.
+    if (
+        trip is not None
+        and output.fixed_metadata is not None
+        and output.fixed_metadata.mcap is not None
+    ):
+        if earliest_frame_ns is None:
+            earliest_frame_ns = _first_minute_ns(trip_manifest)
+        _handle_fixed_metadata_mcap_format(
+            build_fixed_metadata_path(trip_dir),
+            trip,
+            output.fixed_metadata.mcap,
+            earliest_frame_ns,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -140,9 +176,6 @@ def _format_fixed_metadata(
     if output.fixed_metadata is not None and output.fixed_metadata.json_format is not None:
         _handle_fixed_metadata_json_format(csv_path, trip, output.fixed_metadata.json_format)
 
-    if output.fixed_metadata is not None and output.fixed_metadata.mcap is not None:
-        _handle_fixed_metadata_mcap_format(csv_path, trip, output.fixed_metadata.mcap)
-
     if output.fixed_metadata is None or output.fixed_metadata.csv is None:
         _handle_fixed_metadata_csv_disabled(csv_path)
 
@@ -167,14 +200,21 @@ def _handle_fixed_metadata_json_format(
     trip.save_to_json_file(json_path, fmt)
 
 
+def _first_minute_ns(trip_manifest: TripManifest) -> int:
+    """The trip's first minute in nanoseconds, for a trip with no telemetry."""
+    stamps = [m.minute_epoch for m in trip_manifest.minutes if m.minute_epoch is not None]
+    return min(stamps) * 1_000_000 if stamps else 0
+
+
 def _handle_fixed_metadata_mcap_format(
     csv_path: Path,
     trip: TripMetadata,
     fmt,
+    log_time_ns: int = 0,
 ) -> None:
     """Save fixed_metadata as MCAP according to configured format."""
     mcap_path = str(csv_path.with_suffix(".mcap"))
-    trip.save_to_mcap_file(mcap_path, fmt)
+    trip.save_to_mcap_file(mcap_path, fmt, log_time_ns=log_time_ns)
     trip_dir = str(csv_path.parent)
     shutil.copy2(
         "./utils/mcap/minute_metadata.proto",
@@ -344,6 +384,13 @@ def _build_trip_insight(
                 "Unwrapped %d legacy array fields on minutes in %s", scalarized, trip_dir.name
             )
 
+        dropped = _restrict_minutes_to_manifest(base_insights, trip_manifest)
+        if dropped:
+            logger.info(
+                "Dropped %d minute(s) not in the trip manifest from base_insights in %s",
+                dropped, trip_dir.name,
+            )
+
         filled = _fill_missing_minute_places(base_insights, trip_manifest)
         if filled:
             summary = ", ".join(f"{field}×{count}" for field, count in filled.items())
@@ -353,10 +400,15 @@ def _build_trip_insight(
 
         trip_insight["base_insights"] = base_insights
 
+    minute_dirs = _manifest_minute_dir_names(trip_manifest)
     if insight_output.safety_critical_events:
-        trip_insight["safety_critical_events"] = _load_safety_critical_events(trip_dir)
+        trip_insight["safety_critical_events"] = _restrict_events_to_minutes(
+            _load_safety_critical_events(trip_dir), minute_dirs
+        )
     if insight_output.ego_actions:
-        trip_insight["ego_actions"] = _load_ego_actions(trip_dir)
+        trip_insight["ego_actions"] = _restrict_events_to_minutes(
+            _load_ego_actions(trip_dir), minute_dirs
+        )
 
     trip_insight_path = build_trip_insight_path(trip_dir)
     with trip_insight_path.open("w", encoding="utf-8") as f:
@@ -395,6 +447,57 @@ def _scalarize_minute_fields(base_insights: dict) -> int:
                     data[field] = value[0] if value else None
                     changed += 1
     return changed
+
+
+def _manifest_minute_dir_names(trip_manifest: TripManifest) -> set[str]:
+    """``HH-MM-SS`` folder names of the manifest's minutes (the delivered ones)."""
+    timezone = _get_timezone(trip_manifest)
+    if timezone is None:
+        return set()
+    return {
+        get_minute_dir_name(minute.minute_epoch, timezone)
+        for minute in trip_manifest.minutes
+        if minute.minute_epoch is not None
+    }
+
+
+def _restrict_minutes_to_manifest(base_insights: dict, trip_manifest: TripManifest) -> int:
+    """Drop ``base_insights.minutes`` entries for minutes the manifest does not carry.
+
+    The feature file describes the whole trip; a TRIPS_FILE minute selection trims
+    the manifest, so the delivered trip_insight.json must describe only the minutes
+    on disk. Entries are keyed ``YYYY-MM-DD_HH-MM`` (``MinuteManifest.get_minute_key``).
+    Trip-level totals (duration, distance, …) are left as they are. Returns the number
+    of entries dropped — zero for an untrimmed trip.
+    """
+    minutes = base_insights.get("minutes")
+    if not isinstance(minutes, list):
+        return 0
+    keys = {m.get_minute_key() for m in trip_manifest.minutes}
+    keys.discard(None)
+    if not keys:
+        return 0
+    kept = [
+        entry
+        for entry in minutes
+        if not isinstance(entry, dict) or any(key in keys for key in entry)
+    ]
+    dropped = len(minutes) - len(kept)
+    base_insights["minutes"] = kept
+    return dropped
+
+
+def _restrict_events_to_minutes(events: list, minute_dirs: set[str]) -> list:
+    """Keep events whose ``minute_dir`` is a delivered minute (no ``minute_dir`` → kept)."""
+    if not minute_dirs:
+        return events
+    return [
+        event
+        for event in events
+        if not isinstance(event, dict)
+        or event.get("minute_dir") is None
+        or event["minute_dir"] in minute_dirs
+    ]
 
 
 # Per-minute geocoding fields we backfill when generation left a gap, mapped to the

@@ -226,12 +226,41 @@ def embed_xmp_into_video(xmp_file_path: str, video_file_path: str):
         # ?  'ValueError: filedescriptor out of range in select()' --> More info: https://discord.com/channels/755797452602474531/1428036398924959777/1439975315274338314
         # with exiftool.ExifTool() as et:
         #     et.execute(b"-overwrite_original", f"-xmp<={xmp_file_path}".encode("utf-8"), video_file_path.encode("utf-8"))
-        subprocess.run(["exiftool", f"-XMP<={xmp_file_path}", "-overwrite_original", str(video_file_path)],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        # remove XMP file
+        # check=True, and stderr captured rather than discarded: a nonzero exit
+        # used to be ignored, so a broken or incompatible exiftool silently
+        # embedded nothing while this logged success and deleted the XMP source.
+        # Nothing downstream re-checks the embedded metadata, so the trip then
+        # validated, moved, and was recorded complete — a silently incomplete
+        # dataset that resume would never revisit.
+        result = subprocess.run(
+            ["exiftool", f"-XMP<={xmp_file_path}", "-overwrite_original", str(video_file_path)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            check=True,
+        )
+        if result.stderr:
+            logger.debug(
+                "exiftool stderr for %s: %s",
+                video_file_path,
+                result.stderr.decode("utf-8", errors="replace")[:500].strip(),
+            )
+        # Only now is the XMP source redundant; on failure it is kept so a retry
+        # does not have to regenerate it.
         if os.path.exists(xmp_file_path):
             os.remove(xmp_file_path)
         logger.info(f"Metadata successfully embedded into {video_file_path}")
+    except subprocess.CalledProcessError as e:
+        detail = (e.stderr or b"").decode("utf-8", errors="replace")[:500].strip()
+        logger.error(
+            "exiftool exited %s embedding metadata into %s: %s",
+            e.returncode,
+            video_file_path,
+            detail or "(no stderr)",
+        )
+        raise RuntimeError(
+            f"Failed to embed metadata into {video_file_path}: exiftool exited "
+            f"{e.returncode}: {detail or '(no stderr)'}"
+        ) from e
     except Exception as e:
         # Log the specific error during embedding
         logger.error(

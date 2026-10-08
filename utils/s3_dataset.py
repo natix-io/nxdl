@@ -78,6 +78,13 @@ def snapshot_from_listing(
         virtual = f"/{bucket}/{key}"
         if virtual == root:
             continue  # object stored at exactly the prefix key would alias the root
+        # Client state (`.natix/…`, the prefix ownership marker) is not dataset
+        # content; skip exactly that reserved top-level segment so the QA layout
+        # checks never report it. Only that one: this snapshot also feeds the
+        # ownership check (build_present_keys), and dropping every dotted name
+        # would let a prefix full of `.abc_1`-style trips look empty and be claimed.
+        if key[len(required_key_prefix):].split("/", 1)[0] == ".natix":
+            continue
         files[virtual] = size
 
         # Register every ancestor between the file and the root.

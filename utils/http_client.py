@@ -32,6 +32,21 @@ def client() -> httpx.Client:
     """The calling process's shared client, built on first use (and after a fork)."""
     global _client, _client_pid
     if _client is None or _client_pid != os.getpid():
+        # Sized to what the busiest caller in this process actually asks for.
+        # Before this was sized, `httpx.Limits(keepalive_expiry=...)` was passed
+        # with nothing else — and `Limits` defaults its two counts to None, which
+        # is UNBOUNDED (the 100/20 figures are httpx's `DEFAULT_LIMITS`, used only
+        # when no `Limits` is passed at all). So this is a tightening from
+        # unbounded, not a change from 100/20.
+        # Download workers run `max_parallel_files` transfers at once; QA's
+        # manifest coverage pass runs `manifest_fetch_workers` requests at once,
+        # in the same process and through this same client. Sizing for downloads
+        # alone left QA's ten threads sharing four connections, so six waited and
+        # could time out of the pool rather than on the network. Plus two, for the
+        # API host alongside the presigned one.
+        from utils.settings import settings  # noqa: PLC0415 - avoids an import cycle
+
+        pool = max(settings.max_parallel_files, settings.manifest_fetch_workers, 1) + 2
         # Do NOT close an inherited client here: its sockets belong to the parent.
         # NOT follow_redirects=True. httpx strips `Authorization` when a redirect
         # crosses origins but forwards any other header, and the API is
@@ -40,7 +55,11 @@ def client() -> httpx.Client:
         # module-level httpx.get this replaced did not follow redirects either;
         # asset downloads opt in per request, and those URLs carry no header.
         _client = httpx.Client(
-            limits=httpx.Limits(keepalive_expiry=KEEPALIVE_EXPIRY_SECONDS),
+            limits=httpx.Limits(
+                max_connections=pool,
+                max_keepalive_connections=pool,
+                keepalive_expiry=KEEPALIVE_EXPIRY_SECONDS,
+            ),
         )
         _client_pid = os.getpid()
     return _client

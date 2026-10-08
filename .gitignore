@@ -1,4 +1,6 @@
 .venv_natix/
+# Vendored exiftool (install.sh --user)
+.natix-tools/
 __pycache__/
 .pytest_cache/
 *.py[cod]

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -32,9 +33,80 @@ EXPECTED_CAMERA_DIR_NAMES = {
 SeiPolicy = Literal["each-minute", "any-minute", "none"]
 DATASET_REQUEST_FILENAME = "dataset_request.json"
 DEFAULT_QA_REPORT_FILENAME = "qa_report.txt"
+# Written by app.event_manifest (CREATE_MANIFEST); kept here rather than imported
+# because event_manifest imports this module.
+EVENT_MANIFEST_FILENAME = "safety_critical_events_manifest.json"
 ALLOWED_DATASET_ROOT_FILENAMES = frozenset(
-    {DATASET_REQUEST_FILENAME, DEFAULT_QA_REPORT_FILENAME}
+    {DATASET_REQUEST_FILENAME, DEFAULT_QA_REPORT_FILENAME, EVENT_MANIFEST_FILENAME}
 )
+
+
+@dataclass(slots=True, frozen=True)
+class DirEntryInfo:
+    """One directory entry, with the type (and size) already known.
+
+    A dataset is hundreds of thousands of entries on a network filesystem where
+    every metadata call is a millisecond or more, so the validator asks the
+    filesystem once per directory and works from the answer: ``os.scandir``
+    returns the type with the name (from ``readdir``'s ``d_type``), and a file's
+    size is taken from the same entry rather than a second ``stat`` at the point
+    of use. Each directory used to be listed two to four times, with a
+    ``is_dir()``/``is_file()`` call per entry on top.
+    """
+
+    path: Path
+    is_dir: bool
+    is_file: bool
+    size: int | None  # files only; None for directories
+
+
+def scan_dir(directory: Path) -> list[DirEntryInfo]:
+    """List ``directory`` once. Empty when it is missing or not a directory."""
+    # The `--s3` mode validates an in-memory snapshot through a pathlib-lookalike
+    # (utils.s3_dataset.S3Path) with nothing on the local filesystem to scan, so
+    # it keeps the iterdir path. It is served from dicts, where listing is free.
+    if getattr(directory, "_snapshot", None) is not None:
+        try:
+            children = list(directory.iterdir())
+        except (FileNotFoundError, NotADirectoryError):
+            return []
+        return [
+            DirEntryInfo(
+                child,
+                child.is_dir(),
+                child.is_file(),
+                child.stat().st_size if child.is_file() else None,
+            )
+            for child in children
+        ]
+
+    try:
+        with os.scandir(directory) as entries:
+            scanned = list(entries)
+    except (FileNotFoundError, NotADirectoryError):
+        return []
+
+    infos: list[DirEntryInfo] = []
+    for entry in scanned:
+        # `DirEntry.is_dir()`/`is_file()` follow symlinks and, unlike pathlib's
+        # predicates, do NOT swallow the errors that can raise: a symlink loop
+        # (ELOOP) or a link through a regular file (ENOTDIR). The parent's
+        # `Path` checks answered False and the entry became a WARN; an uncaught
+        # error here aborted QA with no verdict at all. Neither a dir nor a file
+        # is the truthful answer, and the sweep below reports it.
+        try:
+            is_dir = entry.is_dir()
+            is_file = entry.is_file()
+        except OSError:
+            is_dir = is_file = False
+        size = None
+        if is_file:
+            try:
+                size = entry.stat().st_size
+            except OSError:  # pragma: no cover - vanished between listing and stat
+                size = None
+        infos.append(DirEntryInfo(Path(entry.path), is_dir, is_file, size))
+    return infos
 
 
 def parse_trip_dir_name(name: str) -> tuple[str, int, int]:
@@ -377,6 +449,7 @@ def validate_dataset(
     dataset_dir: Path | None = None,
     allowed_root_files: frozenset[Path] | None = None,
     camera_selection: CAMERA_SELECTION | None = None,
+    workers: int | None = None,
 ) -> ValidationReport:
     target_dir = (dataset_dir or settings.output_dir).resolve()
     camera_selection = resolve_camera_selection(camera_selection)
@@ -395,7 +468,7 @@ def validate_dataset(
         )
         return report
 
-    top_level_entries = list(target_dir.iterdir())
+    top_level_entries = scan_dir(target_dir)
     if not top_level_entries:
         report.unusable = True
         _add_failure(report, "Dataset directory is empty.", target_dir)
@@ -437,19 +510,70 @@ def validate_dataset(
     _validate_region_dirs(report, region_dirs, trip_dirs, allowed_root_files)
     _populate_region_stats(report, trip_dirs)
 
-    for trip_dir in trip_dirs:
-        trip_report = _validate_trip_dir(
-            report,
-            trip_dir,
-            active_policies,
-            saved_request.request,
-            camera_selection=camera_selection,
-        )
+    for trip_report, trip_stats in _validate_trips(
+        trip_dirs,
+        active_policies,
+        saved_request.request,
+        dataset_dir=target_dir,
+        camera_selection=camera_selection,
+        workers=workers if workers is not None else settings.qa_workers,
+    ):
         report.trip_reports.append(trip_report)
+        _merge_stats(report.stats, trip_stats)
 
     report.trip_reports.sort(key=lambda trip_report: trip_report.trip_dir.as_posix())
     report.stats.trip_dirs = len(report.trip_reports)
     return report
+
+
+def _merge_stats(into: ValidationStats, other: ValidationStats) -> None:
+    """Add up per-trip counters. Region counters are filled separately."""
+    for field_name in other.__slots__:
+        setattr(into, field_name, getattr(into, field_name) + getattr(other, field_name))
+
+
+def _validate_trips(
+    trip_dirs: list[Path],
+    policies: ValidationPolicies,
+    dataset_request: DatasetRequest,
+    *,
+    dataset_dir: Path,
+    camera_selection: CAMERA_SELECTION | None,
+    workers: int,
+) -> list[tuple[TripReport, ValidationStats]]:
+    """Validate each trip, concurrently when it is worth it.
+
+    Threads, not processes: the work is metadata syscalls, which release the GIL
+    while they wait, and on a network filesystem (GPFS, Lustre, NFS) that wait is
+    the whole cost — a millisecond or more per call against microseconds locally.
+    Threads also keep the ``--s3`` mode working, where the "filesystem" is an
+    in-memory snapshot that cannot be pickled to a worker process.
+
+    Each trip builds its own report and stats, which the caller merges, so no two
+    threads touch the same object.
+    """
+
+    def one(trip_dir: Path) -> tuple[TripReport, ValidationStats]:
+        local = ValidationReport(dataset_dir=dataset_dir)
+        trip_report = _validate_trip_dir(
+            local,
+            trip_dir,
+            policies,
+            dataset_request,
+            camera_selection=camera_selection,
+        )
+        return trip_report, local.stats
+
+    # Below this a pool costs more than it saves; the tree is small either way.
+    if workers <= 1 or len(trip_dirs) < 32:
+        return [one(trip_dir) for trip_dir in trip_dirs]
+
+    from concurrent.futures import ThreadPoolExecutor  # noqa: PLC0415
+
+    with ThreadPoolExecutor(
+        max_workers=min(workers, len(trip_dirs)), thread_name_prefix="qa"
+    ) as pool:
+        return list(pool.map(one, trip_dirs))
 
 
 def validation_exit_code(report: ValidationReport) -> int:
@@ -496,15 +620,26 @@ def validate_trip(
 def _discover_trip_dirs(dataset_dir: Path) -> list[Path]:
     """Find trip folders via country/state layout without walking minute/camera files."""
     discovered: list[Path] = []
-    for country_dir in sorted(p for p in dataset_dir.iterdir() if p.is_dir()):
-        for entry in sorted(country_dir.iterdir()):
-            if not entry.is_dir():
-                continue
+    # Dot entries are the client's own state (run lock, dataset marker under
+    # .natix/, a staging dir left by a killed publish), never dataset content —
+    # skipped at every level so they are neither judged nor reported as stray.
+    for country_dir in sorted(
+        e.path
+        for e in scan_dir(dataset_dir)
+        if e.is_dir and not e.path.name.startswith(".")
+    ):
+        for entry in sorted(
+            e.path
+            for e in scan_dir(country_dir)
+            if e.is_dir and not e.path.name.startswith(".")
+        ):
             if TRIP_DIR_RE.fullmatch(entry.name):
                 discovered.append(entry)
                 continue
-            for trip_dir in sorted(entry.iterdir()):
-                if trip_dir.is_dir() and TRIP_DIR_RE.fullmatch(trip_dir.name):
+            for trip_dir in sorted(
+                e.path for e in scan_dir(entry) if e.is_dir
+            ):
+                if TRIP_DIR_RE.fullmatch(trip_dir.name):
                     discovered.append(trip_dir)
     return discovered
 
@@ -557,8 +692,11 @@ def _validate_region_dirs(
 ) -> None:
     trip_dir_set = set(trip_dirs)
     for region_dir in sorted(region_dirs):
-        for child in sorted(region_dir.iterdir()):
-            if child.is_file():
+        for entry in sorted(scan_dir(region_dir), key=lambda e: e.path):
+            child = entry.path
+            if child.name.startswith("."):
+                continue
+            if entry.is_file:
                 if (
                     region_dir.resolve() == report.dataset_dir.resolve()
                     and _is_allowed_dataset_root_file(
@@ -576,7 +714,7 @@ def _validate_region_dirs(
                 continue
             if child in trip_dir_set or child in region_dirs:
                 continue
-            if child.is_dir():
+            if entry.is_dir:
                 _add_warning(
                     report,
                     "Unexpected directory outside the canonical country/state/trip layout.",
@@ -627,16 +765,14 @@ def _validate_trip_dir(
                 trip_dir,
             )
 
+    entries = scan_dir(trip_dir)
     minute_dirs = sorted(
-        child
-        for child in trip_dir.iterdir()
-        if child.is_dir() and MINUTE_DIR_RE.fullmatch(child.name)
+        e.path for e in entries if e.is_dir and MINUTE_DIR_RE.fullmatch(e.path.name)
     )
     other_dirs = sorted(
-        child
-        for child in trip_dir.iterdir()
-        if child.is_dir() and not MINUTE_DIR_RE.fullmatch(child.name)
+        e.path for e in entries if e.is_dir and not MINUTE_DIR_RE.fullmatch(e.path.name)
     )
+    trip_files = {e.path: e.size for e in entries if e.is_file}
 
     if not minute_dirs:
         _add_failure(trip_report, "Trip does not contain any minute folders.", trip_dir)
@@ -657,7 +793,9 @@ def _validate_trip_dir(
 
     report.stats.minute_dirs += len(minute_dirs)
     trip_report.minute_count = len(minute_dirs)
-    _validate_trip_metadata_files(report, trip_report, trip_dir, dataset_request)
+    _validate_trip_metadata_files(
+        report, trip_report, trip_dir, dataset_request, trip_files
+    )
 
     for minute_dir in minute_dirs:
         minute_status = _validate_minute_dir(
@@ -716,16 +854,30 @@ def _validate_configured_trip_file(
     stat_attr: str,
     missing_message: str,
     disabled_message: str,
+    present: dict[Path, int | None] | None = None,
 ) -> None:
+    """``present`` is the trip directory's listing; membership answers "does this
+    file exist" without a metadata call per candidate name.
+
+    A miss falls back to ``exists()``: the listing is compared exactly, while
+    macOS and Windows resolve names case-insensitively, so a file stored as
+    ``FIXED_METADATA.csv`` is present on disk yet absent from the listing under
+    the name we look for. Reporting it missing would be a false failure.
+    """
+    exists = path in present if present is not None else path.exists()
+    if present is not None and not exists:
+        exists = path.exists()
     if enabled:
-        if not path.exists():
+        if not exists:
             _add_failure(trip_report, missing_message, path)
             return
         setattr(report.stats, stat_attr, getattr(report.stats, stat_attr) + 1)
-        _validate_non_empty_file(trip_report, path)
+        _validate_non_empty_file(
+            trip_report, path, size=present.get(path) if present is not None else None
+        )
         return
 
-    if path.exists():
+    if exists:
         setattr(report.stats, stat_attr, getattr(report.stats, stat_attr) + 1)
         _add_warning(trip_report, disabled_message, path)
 
@@ -735,6 +887,7 @@ def _validate_trip_metadata_files(
     trip_report: TripReport,
     trip_dir: Path,
     dataset_request: DatasetRequest,
+    trip_files: dict[Path, int | None] | None = None,
 ) -> None:
     allowed_files = {
         "fixed_metadata.csv",
@@ -755,6 +908,7 @@ def _validate_trip_metadata_files(
         stat_attr="fixed_metadata_csv_files",
         missing_message="Missing fixed_metadata.csv.",
         disabled_message="fixed_metadata.csv exists even though CSV output is disabled in the dataset request.",
+        present=trip_files,
     )
     _validate_configured_trip_file(
         report,
@@ -765,6 +919,7 @@ def _validate_trip_metadata_files(
         stat_attr="fixed_metadata_json_files",
         missing_message="Missing fixed_metadata.json.",
         disabled_message="fixed_metadata.json exists even though JSON output is disabled in the dataset request.",
+        present=trip_files,
     )
     _validate_configured_trip_file(
         report,
@@ -775,6 +930,7 @@ def _validate_trip_metadata_files(
         stat_attr="fixed_metadata_mcap_files",
         missing_message="Missing fixed_metadata.mcap.",
         disabled_message="fixed_metadata.mcap exists even though MCAP output is disabled in the dataset request.",
+        present=trip_files,
     )
     _validate_configured_trip_file(
         report,
@@ -784,13 +940,17 @@ def _validate_trip_metadata_files(
         stat_attr="trip_insight_files",
         missing_message="Missing trip_insight.json.",
         disabled_message="trip_insight.json exists even though trip insight output is disabled in the dataset request.",
+        present=trip_files,
     )
 
     _validate_request_features(trip_report, trip_dir, dataset_request)
 
-    for child in sorted(trip_dir.iterdir()):
-        if not child.is_file():
-            continue
+    files = (
+        sorted(trip_files)
+        if trip_files is not None
+        else sorted(e.path for e in scan_dir(trip_dir) if e.is_file)
+    )
+    for child in files:
         if child.name in allowed_files:
             continue
         _add_warning(trip_report, "Unexpected file inside trip folder.", child)
@@ -884,16 +1044,16 @@ def _validate_minute_dir(
     health_grade: int = 500,
     camera_selection: CAMERA_SELECTION | None = None,
 ) -> MinuteSeiStatus:
+    entries = scan_dir(minute_dir)
     camera_dirs = sorted(
-        child
-        for child in minute_dir.iterdir()
-        if child.is_dir() and child.name in EXPECTED_CAMERA_DIR_NAMES
+        e.path for e in entries if e.is_dir and e.path.name in EXPECTED_CAMERA_DIR_NAMES
     )
     unknown_dirs = sorted(
-        child
-        for child in minute_dir.iterdir()
-        if child.is_dir() and child.name not in EXPECTED_CAMERA_DIR_NAMES
+        e.path
+        for e in entries
+        if e.is_dir and e.path.name not in EXPECTED_CAMERA_DIR_NAMES
     )
+    file_sizes = {e.path: e.size for e in entries if e.is_file}
 
     for unknown_dir in unknown_dirs:
         _add_warning(
@@ -919,13 +1079,23 @@ def _validate_minute_dir(
         if failure_message:
             _add_failure(trip_report, failure_message, minute_dir)
 
+    # Presence is asked of the filesystem, not of the listing. `file_sizes` is
+    # keyed by the name readdir returned, so a case-insensitive filesystem holding
+    # MAPPING.TXT has no `mapping.txt` key (the parent warned about the spelling;
+    # keying off the listing failed the minute instead), and a FIFO named
+    # mapping.txt is not in the listing at all (the parent warned; keying off the
+    # listing passed it silently). The cached size is still used when there is one,
+    # so the ordinary case costs no extra metadata call.
+    mapping_exists = mapping_path in file_sizes or mapping_path.exists()
     if output.minute.mapping_file:
-        if not mapping_path.exists():
+        if not mapping_exists:
             _add_failure(trip_report, "Missing mapping.txt.", mapping_path)
         else:
             report.stats.mapping_files += 1
-            _validate_non_empty_file(trip_report, mapping_path)
-    elif mapping_path.exists():
+            _validate_non_empty_file(
+                trip_report, mapping_path, size=file_sizes.get(mapping_path)
+            )
+    elif mapping_exists:
         report.stats.mapping_files += 1
         _add_warning(
             trip_report,
@@ -934,11 +1104,9 @@ def _validate_minute_dir(
         )
 
     fused_files = sorted(
-        child
-        for child in minute_dir.iterdir()
-        if child.is_file()
-        and child.name.startswith("FUSED_")
-        and child.name.endswith(".sei.csv")
+        path
+        for path in file_sizes
+        if path.name.startswith("FUSED_") and path.name.endswith(".sei.csv")
     )
     if len(fused_files) > 1:
         _add_warning(
@@ -950,7 +1118,10 @@ def _validate_minute_dir(
     for fused_file in fused_files:
         report.stats.fused_sei_files += 1
         if _validate_non_empty_file(
-            trip_report, fused_file, message="Fused SEI CSV is empty."
+            trip_report,
+            fused_file,
+            message="Fused SEI CSV is empty.",
+            size=file_sizes[fused_file],
         ):
             has_valid_fused = True
 
@@ -985,13 +1156,15 @@ def _validate_minute_dir(
             minute_dir,
         )
 
+    # Everything that is not a directory, not only what stat calls a regular
+    # file: a FIFO or a dangling symlink in a minute folder is exactly as
+    # unexpected, and used to be reported before this loop worked from the
+    # listing's file flag.
     allowed_files = {"mapping.txt", *(path.name for path in fused_files)}
-    for child in sorted(minute_dir.iterdir()):
-        if child.is_dir():
+    for entry in sorted(entries, key=lambda e: e.path):
+        if entry.is_dir or entry.path.name in allowed_files:
             continue
-        if child.name in allowed_files:
-            continue
-        _add_warning(trip_report, "Unexpected file inside minute folder.", child)
+        _add_warning(trip_report, "Unexpected file inside minute folder.", entry.path)
 
     return MinuteSeiStatus(
         camera_dirs=camera_dirs,
@@ -1007,13 +1180,14 @@ def _validate_camera_dir(
     output: DatasetOutput,
     health_grade: int = 500,
 ) -> bool:
-    nested_dirs = [child for child in camera_dir.iterdir() if child.is_dir()]
-    for nested_dir in nested_dirs:
+    entries = scan_dir(camera_dir)
+    for nested in (e for e in entries if e.is_dir):
         _add_warning(
-            trip_report, "Unexpected nested directory inside camera folder.", nested_dir
+            trip_report, "Unexpected nested directory inside camera folder.", nested.path
         )
 
-    files = sorted(child for child in camera_dir.iterdir() if child.is_file())
+    sizes = {e.path: e.size for e in entries if e.is_file}
+    files = sorted(sizes)
     video_files = [path for path in files if path.suffix == ".mp4"]
     link_files = [path for path in files if path.name.endswith(VIDEO_LINK_SUFFIX)]
     telemetry_csv_files = [
@@ -1050,9 +1224,9 @@ def _validate_camera_dir(
         )
 
     for video_file in video_files:
-        _validate_non_empty_file(trip_report, video_file)
+        _validate_non_empty_file(trip_report, video_file, size=sizes.get(video_file))
     for link_file in link_files:
-        _validate_non_empty_file(trip_report, link_file)
+        _validate_non_empty_file(trip_report, link_file, size=sizes.get(link_file))
 
     telemetry_csv_path: Path | None = None
     if output.footage.csv is not None and health_grade != 0:
@@ -1063,7 +1237,9 @@ def _validate_camera_dir(
             expected_label="telemetry CSV",
         )
         if telemetry_csv_path is not None:
-            _validate_non_empty_file(trip_report, telemetry_csv_path)
+            _validate_non_empty_file(
+                trip_report, telemetry_csv_path, size=sizes.get(telemetry_csv_path)
+            )
     elif telemetry_csv_files:
         for telemetry_csv_file in telemetry_csv_files:
             _add_warning(
@@ -1081,7 +1257,9 @@ def _validate_camera_dir(
             expected_label="telemetry MCAP",
         )
         if telemetry_mcap_path is not None:
-            _validate_non_empty_file(trip_report, telemetry_mcap_path)
+            _validate_non_empty_file(
+                trip_report, telemetry_mcap_path, size=sizes.get(telemetry_mcap_path)
+            )
     elif telemetry_mcap_files:
         for telemetry_mcap_file in telemetry_mcap_files:
             _add_warning(
@@ -1097,7 +1275,9 @@ def _validate_camera_dir(
             camera_dir,
         )
     has_valid_sei = bool(sei_files) and all(
-        _validate_non_empty_file(trip_report, sei_file, message="SEI CSV is empty.")
+        _validate_non_empty_file(
+            trip_report, sei_file, message="SEI CSV is empty.", size=sizes.get(sei_file)
+        )
         for sei_file in sei_files
     )
 
@@ -1142,11 +1322,18 @@ def _validate_non_empty_file(
     issues_owner: ValidationReport | TripReport,
     path: Path,
     message: str | None = None,
+    *,
+    size: int | None = None,
 ) -> bool:
-    if not path.exists():
-        _add_failure(issues_owner, "Expected file is missing.", path)
-        return False
-    if path.stat().st_size <= 0:
+    """``size`` is the size already read from the directory listing; pass it to
+    avoid a second metadata call per file (see :func:`scan_dir`). Omit it and the
+    file is stat'ed here, as before."""
+    if size is None:
+        if not path.exists():
+            _add_failure(issues_owner, "Expected file is missing.", path)
+            return False
+        size = path.stat().st_size
+    if size <= 0:
         _add_failure(issues_owner, message or "Required file is empty.", path)
         return False
     return True

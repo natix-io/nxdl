@@ -4,7 +4,11 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from app.trip_downloader import get_ds_manifest, get_trip_manifest
+from app.trip_downloader import (
+    MANIFEST_BATCH_SIZE,
+    get_ds_manifest,
+    get_trip_manifests,
+)
 from app.validation import _discover_trip_dirs, parse_trip_dir_name
 from schemas.dataset_request import DatasetOutput, SavedDatasetRequest
 from schemas.trip_manifest import TripManifest
@@ -19,11 +23,21 @@ from utils.path_helpers import (
 )
 from utils.settings import settings
 from utils.trip_list import format_trip_key
+from utils.trip_selection import TripSelectionMap, load_trips_selection, select_minutes
 
 
 @dataclass(slots=True)
 class ManifestCoverageResult:
     note: str | None = None
+    # How many of the present trips the per-trip FILE check actually covered,
+    # and how many there were. None means every one of them. Missing-trip
+    # detection is never sampled, so this bounds the file check only. The
+    # report used to decide whether to print that caveat by substring-matching
+    # "sampled" in the note above — a note this module builds itself — so any
+    # reword silently dropped it and a sampled report claimed completeness it
+    # had not checked.
+    sampled_trips: int | None = None
+    present_trips: int = 0
     missing_files: list[str] = field(default_factory=list)
     missing_minutes: list[str] = field(default_factory=list)
     # Trips in the dataset manifest that are entirely absent on disk/S3, split by
@@ -104,18 +118,19 @@ def build_expected_trip_files(
             )
             expected.append(video_path.relative_to(trip_root))
 
-            # Only the CSV format keeps the telemetry file in the delivered dataset:
-            # with footage.csv disabled it is either never downloaded or deleted after
-            # EXIF/MCAP consume it (see app.ds_formatter), so it must not be expected.
+            # Match the published telemetry outputs: MCAP is derived from the CSV,
+            # which the formatter removes when CSV output is disabled.
             if (
                 trip_manifest.health_grade != 0
                 and camera.telemetry is not None
-                and output.footage.csv is not None
             ):
                 telemetry_path = build_camera_file_path(
                     camera_dir, camera.telemetry.presigned_url
-                )
-                expected.append(telemetry_path.relative_to(trip_root))
+                ).relative_to(trip_root)
+                if output.footage.csv is not None:
+                    expected.append(telemetry_path)
+                if output.footage.mcap is not None:
+                    expected.append(telemetry_path.with_suffix(".mcap"))
 
             if output.footage.sei is not None and (
                 camera.sei is not None or camera.sei_status in ("restoring", "archived")
@@ -135,7 +150,16 @@ def collect_manifest_missing_files(
     max_trips: int | None = None,
     uploaded_only: bool = False,
 ) -> ManifestCoverageResult:
-    """Compare on-disk/S3 content against trip manifests from the API."""
+    """Compare on-disk/S3 content against trip manifests from the API.
+
+    Two different checks, deliberately scoped differently:
+
+    * **Which trips are absent** — always complete, over every trip of the
+      dataset. It needs no per-trip request to find them, only to classify them.
+    * **Which files of a trip are absent** — one trip-manifest request each, so
+      ``max_trips`` samples it over the trips that are present, and the report
+      says how many of how many were checked.
+    """
     api_key = settings.api_key.strip()
     dataset_id = settings.dataset_id.strip()
     if not api_key or not dataset_id:
@@ -154,6 +178,17 @@ def collect_manifest_missing_files(
     output = saved_request.request.output
     dry_mode = settings.dry_mode
 
+    # The same TRIPS_FILE the download ran with: trips outside it were never
+    # expected, and a trip's unselected minutes must not count as missing.
+    selection: TripSelectionMap | None = None
+    if settings.trips_file.strip():
+        try:
+            selection = load_trips_selection(Path(settings.trips_file).expanduser())
+        except (FileNotFoundError, ValueError) as exc:
+            return ManifestCoverageResult(
+                note=f"manifest file coverage skipped: TRIPS_FILE unusable: {exc}",
+            )
+
     missing_files: list[str] = []
     missing_minutes: list[str] = []
     missing_trips: list[str] = []
@@ -162,63 +197,102 @@ def collect_manifest_missing_files(
     trip_summaries: list[str] = []
     fetch_errors: list[str] = []
 
-    trips_to_check = list(ds_manifest.trips)
-    if trip_filter is not None:
-        trips_to_check = [
+    candidates = list(ds_manifest.trips)
+    if selection is not None:
+        candidates = [
             trip
-            for trip in trips_to_check
+            for trip in candidates
+            if (trip.trip_id, trip.sub_trip, trip.health_grade) in selection
+        ]
+    if trip_filter is not None:
+        candidates = [
+            trip
+            for trip in candidates
             if (trip.trip_id, trip.sub_trip, trip.health_grade) in trip_filter
         ]
-    if uploaded_only:
-        trips_to_check = [
-            trip
-            for trip in trips_to_check
-            if (trip.trip_id, trip.sub_trip, trip.health_grade) in discovered_trips
-        ]
-    trips_to_check.sort(
-        key=lambda trip: (
-            # discovered_trips is keyed by the full three-part identity — comparing a
-            # pair here silently made this sort key constant.
-            0
-            if (trip.trip_id, trip.sub_trip, trip.health_grade) in discovered_trips
-            else 1,
-            trip.trip_id,
-            trip.sub_trip,
-            trip.health_grade,
-        )
-    )
+
+    # Which trips are missing entirely is answered for EVERY trip, always: the
+    # dataset manifest is already in hand, so the comparison is free, and it is
+    # the check that catches a half-downloaded dataset. Only their manifests are
+    # fetched (to say WHY each is absent), and a healthy dataset has none.
+    #
+    # File-level coverage is the expensive part — one trip-manifest request per
+    # trip, tens of thousands of them — so it is sampled over the trips that ARE
+    # present, and the report says so. Sampling the absent ones instead would let
+    # a dataset missing 40,000 trips report clean.
+    absent = [
+        trip
+        for trip in candidates
+        if (trip.trip_id, trip.sub_trip, trip.health_grade) not in discovered_trips
+    ]
+    present = [
+        trip
+        for trip in candidates
+        if (trip.trip_id, trip.sub_trip, trip.health_grade) in discovered_trips
+    ]
+    present.sort(key=lambda trip: (trip.trip_id, trip.sub_trip, trip.health_grade))
+    absent.sort(key=lambda trip: (trip.trip_id, trip.sub_trip, trip.health_grade))
+
     coverage_notes: list[str] = []
-    if uploaded_only:
+    sampled = present
+    if max_trips is not None and len(present) > max_trips:
+        sampled = present[:max_trips]
         coverage_notes.append(
-            "manifest file coverage limited to trips present on disk/S3"
+            f"manifest file coverage sampled: {len(sampled)} of {len(present)} "
+            "downloaded trip(s) checked file-by-file"
         )
-    if max_trips is not None:
-        trips_to_check = trips_to_check[:max_trips]
-        coverage_notes.append(f"manifest file coverage limited to {max_trips} trip(s)")
+    if selection is not None:
+        coverage_notes.append(
+            f"manifest file coverage limited to the trips/minutes in {settings.trips_file}"
+        )
+    if uploaded_only:
+        absent = []
+        coverage_notes.append(
+            "missing-trip detection disabled (--manifest-uploaded-only)"
+        )
+    trips_to_check = [*sampled, *absent]
 
-    def _fetch(ds_trip):
-        try:
-            manifest = get_trip_manifest(
-                api_key, dataset_id, ds_trip.trip_id, ds_trip.sub_trip, ds_trip.health_grade
-            )
-            return ds_trip, manifest, None
-        except Exception as exc:
-            return ds_trip, None, exc
-
-    # Trip-manifest fetches are pure network I/O — run them concurrently.
+    # Manifest fetching is the whole cost of this check — one request per trip
+    # against a dataset that can hold ~180k of them. `get_trip_manifests` asks the
+    # service for 25 at a time where it supports that, and falls back to one
+    # request per trip where it does not. The remaining requests are still pure
+    # network I/O, so they are also spread over a thread pool.
+    keys = [(t.trip_id, t.sub_trip, t.health_grade) for t in trips_to_check]
     workers = max(1, settings.manifest_fetch_workers)
-    if workers > 1 and len(trips_to_check) > 1:
+    batches = [
+        keys[i : i + MANIFEST_BATCH_SIZE]
+        for i in range(0, len(keys), MANIFEST_BATCH_SIZE)
+    ]
+
+    def _fetch_batch(batch):
+        return get_trip_manifests(api_key, dataset_id, batch)
+
+    manifests: dict = {}
+    errors: dict = {}
+    if workers > 1 and len(batches) > 1:
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            fetched = list(pool.map(_fetch, trips_to_check))
+            for got, failed in pool.map(_fetch_batch, batches):
+                manifests.update(got)
+                errors.update(failed)
     else:
-        fetched = [_fetch(ds_trip) for ds_trip in trips_to_check]
+        for batch in batches:
+            got, failed = _fetch_batch(batch)
+            manifests.update(got)
+            errors.update(failed)
 
-    for ds_trip, trip_manifest, exc in fetched:
+    for ds_trip in trips_to_check:
         trip_key = (ds_trip.trip_id, ds_trip.sub_trip, ds_trip.health_grade)
+        trip_manifest = manifests.get(trip_key)
 
-        if exc is not None:
-            fetch_errors.append(f"{format_trip_key(trip_key)}: {exc}")
+        if trip_manifest is None:
+            fetch_errors.append(
+                f"{format_trip_key(trip_key)}: {errors.get(trip_key, 'no manifest returned')}"
+            )
             continue
+
+        selected_minutes = selection.get(trip_key) if selection is not None else None
+        if selected_minutes is not None:
+            trip_manifest, _missing = select_minutes(trip_manifest, selected_minutes)
 
         trip_dir = discovered_trips.get(trip_key)
         if trip_dir is None:
@@ -269,6 +343,8 @@ def collect_manifest_missing_files(
 
     return ManifestCoverageResult(
         note=note,
+        sampled_trips=len(sampled) if len(sampled) < len(present) else None,
+        present_trips=len(present),
         missing_files=sorted(set(missing_files)),
         missing_minutes=sorted(set(missing_minutes)),
         missing_trips=sorted(set(missing_trips)),
