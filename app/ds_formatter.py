@@ -28,6 +28,7 @@ from utils.path_helpers import (
     is_camera_allowed,
 )
 from utils.settings import settings
+from utils.trip_stats import GpsFix, gps_fixes, partial_trip_stats
 
 logger = logging.getLogger(__name__)
 
@@ -36,11 +37,21 @@ def _get_timezone(trip_manifest: TripManifest) -> str | None:
     return trip_manifest.timezone
 
 
-def format_ds(trip_manifest: TripManifest, trip_dir: Path, output: DatasetOutput) -> None:
-    trip = _format_fixed_metadata(trip_manifest, trip_dir, output)
+def format_ds(
+    trip_manifest: TripManifest,
+    trip_dir: Path,
+    output: DatasetOutput,
+    *,
+    partial: bool = False,
+) -> None:
+    """Write ``trip_dir``'s delivered outputs from its downloaded files.
 
-    if output.trip_insight is not None:
-        _build_trip_insight(trip_manifest, trip_dir, output.trip_insight)
+    ``partial`` says the folder holds only some of the trip's minutes (one segment
+    of a chopped trip, or a TRIPS_FILE minute selection). Its trip insight then gets
+    trip-level stats recomputed for those minutes (see ``utils.trip_stats``) instead
+    of the whole trip's.
+    """
+    trip = _format_fixed_metadata(trip_manifest, trip_dir, output)
 
     # `trip` is None only when nothing consumes it (see _needs_fixed_metadata), which
     # includes EXIF embedding — so the per-camera pass below stays valid either way.
@@ -58,6 +69,9 @@ def format_ds(trip_manifest: TripManifest, trip_dir: Path, output: DatasetOutput
     # the frames are parsed below (see utils.footage.delivered_time_ns), so that
     # `app.regen` reads the same answer back from those files.
     earliest_frame_ns: int | None = None
+    # GPS track per minute, for a partial trip's stats. One camera per minute: every
+    # camera of a minute carries the same device fixes, so more would count it twice.
+    fixes_by_minute: dict[int, list[GpsFix]] = {}
 
     for minute in trip_manifest.minutes:
         minute_dir = build_minute_directory_path(trip_dir, minute.minute_epoch, timezone)
@@ -88,6 +102,10 @@ def format_ds(trip_manifest: TripManifest, trip_dir: Path, output: DatasetOutput
                 raise Exception(f"Telemetry file not found: {telemetry_path}")
 
             frames: list[FrameData] = parse_telemetry_csv(telemetry_path)
+            if partial and minute.minute_epoch is not None and minute.minute_epoch not in fixes_by_minute:
+                fixes = gps_fixes(frames)
+                if fixes:
+                    fixes_by_minute[minute.minute_epoch] = fixes
             first = delivered_time_ns(
                 frames, timezone, csv_fmt if csv_enabled else None, mcap_enabled
             )
@@ -113,6 +131,16 @@ def format_ds(trip_manifest: TripManifest, trip_dir: Path, output: DatasetOutput
                 _handle_footage_csv_disabled(telemetry_path)
         if write_mapping:
             _handle_minute_mapping_file(minute_dir, minute)
+
+    # After the loop: a partial trip's stats need the GPS fixes read above, before
+    # the CSV rewrite/cleanup changed or removed the telemetry files.
+    if output.trip_insight is not None:
+        _build_trip_insight(
+            trip_manifest,
+            trip_dir,
+            output.trip_insight,
+            trip_stats=partial_trip_stats(trip_manifest, fixes_by_minute) if partial else None,
+        )
 
     # After the loop, deliberately. The trip-level metadata record carries no time
     # of its own and a zero one drops out of every time-filtered read, so it is
@@ -360,13 +388,19 @@ def _handle_minute_mapping_file(
 
 
 def _build_trip_insight(
-    trip_manifest: TripManifest, trip_dir: Path, insight_output: TripInsightOutput
+    trip_manifest: TripManifest,
+    trip_dir: Path,
+    insight_output: TripInsightOutput,
+    trip_stats: dict | None = None,
 ) -> None:
     """Merge feature JSON files into the final trip_insight.json response shape.
 
     Each section is included only when requested in ``insight_output`` — an
     unrequested section must not appear in the file at all (not even as an
     empty value), so downstream validation of "not requested => absent" holds.
+
+    ``trip_stats`` replaces the whole trip's ``base_insights`` trip-level fields
+    when the folder holds only part of the trip (see ``utils.trip_stats``).
     """
     trip_insight: dict = {}
 
@@ -389,6 +423,15 @@ def _build_trip_insight(
             logger.info(
                 "Dropped %d minute(s) not in the trip manifest from base_insights in %s",
                 dropped, trip_dir.name,
+            )
+
+        if trip_stats is not None:
+            base_insights.update(trip_stats)
+            logger.info(
+                "Recomputed trip-level stats for the %d minute(s) in %s: %s km",
+                len(trip_manifest.minutes), trip_dir.name,
+                "n/a" if trip_stats["estimatedDistance"] is None
+                else f"{trip_stats['estimatedDistance']:.3f}",
             )
 
         filled = _fill_missing_minute_places(base_insights, trip_manifest)
@@ -467,8 +510,9 @@ def _restrict_minutes_to_manifest(base_insights: dict, trip_manifest: TripManife
     The feature file describes the whole trip; a TRIPS_FILE minute selection trims
     the manifest, so the delivered trip_insight.json must describe only the minutes
     on disk. Entries are keyed ``YYYY-MM-DD_HH-MM`` (``MinuteManifest.get_minute_key``).
-    Trip-level totals (duration, distance, …) are left as they are. Returns the number
-    of entries dropped — zero for an untrimmed trip.
+    Trip-level totals (duration, distance, …) are not touched here; a partial trip's
+    are replaced from ``utils.trip_stats`` by the caller. Returns the number of
+    entries dropped — zero for an untrimmed trip.
     """
     minutes = base_insights.get("minutes")
     if not isinstance(minutes, list):

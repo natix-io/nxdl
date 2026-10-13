@@ -3,6 +3,7 @@ import logging
 import os
 import shutil
 import tempfile
+from collections.abc import Callable, Collection
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,6 +16,8 @@ from schemas import (
     TripManifest,
 )
 from utils.path_helpers import (
+    SEGMENT_LABEL_RE,
+    TripKey,
     build_cache_trip_path,
     build_camera_file_path,
     build_feature_file_path,
@@ -39,6 +42,7 @@ from utils.ledger import (
     TRIP_IN_PROGRESS,
     TRIP_PARTIAL,
     TRIP_PENDING_RESTORE,
+    TRIP_SEGMENTED,
     Reporter,
     archived_message,
     pending_restore_message,
@@ -46,7 +50,7 @@ from utils.ledger import (
 )
 from utils.s3_uploader import upload_trip_atomic
 from utils.settings import settings
-from utils.trip_selection import select_minutes
+from utils.trip_selection import segment_units, select_minutes
 
 logger = logging.getLogger(__name__)
 
@@ -73,7 +77,7 @@ def _scope_digest(output_dir: Path) -> str:
     return _marker_digest[1]
 
 
-def _revoke_claims(output_dir: Path, key: tuple[str, int, int]) -> None:
+def _revoke_claims(output_dir: Path, key: TripKey) -> None:
     """Drop every scope's claim on ``key`` — including this run's own.
 
     Called before a trip is processed and again before it is published, and the
@@ -148,11 +152,12 @@ _batch_route_available: bool | None = None
 def get_trip_manifests(
     api_key: str,
     dataset_id: str,
-    keys: list[tuple[str, int, int]],
-) -> tuple[dict[tuple[str, int, int], TripManifest], dict[tuple[str, int, int], str]]:
+    keys: list[TripKey],
+) -> tuple[dict[TripKey, TripManifest], dict[TripKey, str]]:
     """Manifests for many trips, in as few requests as the service allows.
 
-    Returns ``(manifests, errors)`` keyed by ``(trip_id, sub_trip, health_grade)``;
+    Returns ``(manifests, errors)`` keyed by whole-trip ``TripKey`` (segment ``""``:
+    a manifest is per trip, and carries a chopped trip's segments inside it);
     a trip appears in exactly one of them. Duplicate keys are collapsed first:
     the same trip in two chunks was fetched twice, and if one chunk errored for
     it and the other succeeded it ended up in BOTH dictionaries, which is the one
@@ -165,8 +170,8 @@ def get_trip_manifests(
     does not, it falls back to the per-trip route and the caller cannot tell.
     """
     global _batch_route_available
-    manifests: dict[tuple[str, int, int], TripManifest] = {}
-    errors: dict[tuple[str, int, int], str] = {}
+    manifests: dict[TripKey, TripManifest] = {}
+    errors: dict[TripKey, str] = {}
     remaining = list(dict.fromkeys(keys))
 
     # THIS call's outcome, never the shared global. The global is only a hint
@@ -209,7 +214,9 @@ def get_trip_manifests(
         if key in manifests or key in errors:
             continue
         try:
-            manifests[key] = get_trip_manifest(api_key, dataset_id, *key)
+            manifests[key] = get_trip_manifest(
+                api_key, dataset_id, key.trip_id, key.sub_trip, key.health_grade
+            )
         except Exception as exc:
             errors[key] = f"{type(exc).__name__}: {exc}"
     return manifests, errors
@@ -220,12 +227,13 @@ class _BatchRouteUnavailable(Exception):
 
 
 def _post_trip_manifests(
-    api_key: str, dataset_id: str, keys: list[tuple[str, int, int]]
-) -> tuple[dict[tuple[str, int, int], TripManifest], dict[tuple[str, int, int], str]]:
+    api_key: str, dataset_id: str, keys: list[TripKey]
+) -> tuple[dict[TripKey, TripManifest], dict[TripKey, str]]:
     payload = {
         "dataset_id": dataset_id,
         "trips": [
-            {"trip_id": t, "sub_trip": s, "health_grade": g} for t, s, g in keys
+            {"trip_id": k.trip_id, "sub_trip": k.sub_trip, "health_grade": k.health_grade}
+            for k in keys
         ],
     }
     response = post_with_retry(
@@ -242,13 +250,15 @@ def _post_trip_manifests(
     response.raise_for_status()
     body = response.json()
 
-    manifests: dict[tuple[str, int, int], TripManifest] = {}
+    manifests: dict[TripKey, TripManifest] = {}
     for item in body.get("manifests", []):
         manifest = TripManifest.model_validate(item)
-        manifests[(manifest.trip_id, manifest.sub_trip, manifest.health_grade)] = manifest
-    errors: dict[tuple[str, int, int], str] = {}
+        manifests[TripKey(manifest.trip_id, manifest.sub_trip, manifest.health_grade)] = (
+            manifest
+        )
+    errors: dict[TripKey, str] = {}
     for item in body.get("errors", []):
-        key = (item["trip_id"], int(item["sub_trip"]), int(item["health_grade"]))
+        key = TripKey(item["trip_id"], int(item["sub_trip"]), int(item["health_grade"]))
         if key in manifests:
             # The service contradicted itself: a manifest AND an error for one
             # trip. The manifest is the usable half; recording the error too would
@@ -550,6 +560,7 @@ def _record_download_failures(
     cache_trip_dir: Path,
     failures: list[tuple[_DownloadTask, str]],
     restoring_files: int = 0,
+    segment: str = "",
 ) -> None:
     """Persist per-file failure rows + a detailed trip PARTIAL message.
 
@@ -569,6 +580,7 @@ def _record_download_failures(
             health_grade,
             rel,
             "failed",
+            segment=segment,
             kind=task.kind,
             error_stage="download",
             error_message=message,
@@ -586,13 +598,13 @@ def _record_download_failures(
         sub_trip,
         health_grade,
         TRIP_PARTIAL,
+        segment=segment,
         error_stage="download",
         error_message=message,
     )
     logger.error(
-        "Trip %s_%d: %d file(s) failed to download; kept cache for retry: %s",
-        trip_id,
-        sub_trip,
+        "Trip %s: %d file(s) failed to download; kept cache for retry: %s",
+        TripKey(trip_id, sub_trip, health_grade, segment).dir_name,
         len(failures),
         summary,
     )
@@ -881,6 +893,7 @@ def process_trip(
     s3_target: tuple[str, str] | None = None,
     health_grade: int = 500,
     minutes: frozenset[str] | None = None,
+    completed_segments: Collection[TripKey] = frozenset(),
 ) -> None:
     """Download, format, move and (optionally) upload one trip, tracking status.
 
@@ -891,12 +904,13 @@ def process_trip(
     ``minutes`` (folder names, ``HH-MM-SS``) restricts the trip to those minutes:
     the manifest is trimmed right after each fetch, so every downstream step —
     downloads, expected files, formatting, validation, upload — sees only them.
-    """
-    # build_expected_trip_files lives in manifest_coverage, which imports this
-    # module — import lazily to avoid a circular import at load time.
-    from app.manifest_coverage import build_expected_trip_files  # noqa: PLC0415
 
-    trip_key = (trip_id, sub_trip, health_grade)
+    A chopped trip (``seiData: with_and_chop``: the manifest carries ``segments``)
+    is delivered as one folder per segment — see :func:`_deliver_segments`.
+    ``completed_segments`` are the segment keys the ledger already holds complete;
+    they are not delivered again.
+    """
+    trip_key = TripKey(trip_id, sub_trip, health_grade)
     # A trip that is being worked on is certified by nobody, this run included:
     # everything below can replace or (on S3) roll back and delete its data.
     try:
@@ -931,6 +945,9 @@ def process_trip(
         )
         return
 
+    # Counted before the minute selection: a delivered folder with fewer minutes
+    # holds only part of the trip and gets its trip-level stats recomputed.
+    trip_minute_total = len(trip_manifest.minutes)
     trip_manifest = _apply_minute_selection(trip_manifest, minutes, trip_id, sub_trip)
     if minutes is not None and not trip_manifest.minutes:
         message = f"none of the {len(minutes)} requested minute(s) exist in this trip"
@@ -945,25 +962,292 @@ def process_trip(
         logger.error("Trip %s_%d skipped: %s", trip_id, sub_trip, message)
         return
 
-    country, state = _get_trip_location(trip_manifest)
+    def refetch() -> TripManifest:
+        # Retry with a fresh manifest in case presigned URLs expired; the minute
+        # selection is re-applied so the trim holds across the refresh.
+        return _apply_minute_selection(
+            get_trip_manifest(api_key, dataset_id, trip_id, sub_trip, health_grade),
+            minutes,
+            trip_id,
+            sub_trip,
+        )
+
+    if trip_manifest.segments is None:
+        _deliver_unit(
+            trip_key,
+            trip_manifest,
+            output_dir,
+            output,
+            refetch=refetch,
+            reporter=reporter,
+            cache_dir=cache_dir,
+            present_keys=present_keys,
+            s3_target=s3_target,
+            trip_minute_total=trip_minute_total,
+        )
+        return
+    _deliver_segments(
+        trip_key,
+        trip_manifest,
+        minutes,
+        completed_segments,
+        output_dir,
+        output,
+        refetch=refetch,
+        reporter=reporter,
+        cache_dir=cache_dir,
+        present_keys=present_keys,
+        s3_target=s3_target,
+        trip_minute_total=trip_minute_total,
+    )
+
+
+_NO_SEGMENT_MESSAGE = "no segment: no run of minutes where every camera has SEI"
+
+
+def _deliver_segments(
+    parent: TripKey,
+    manifest: TripManifest,
+    minutes: frozenset[str] | None,
+    completed_segments: Collection[TripKey],
+    output_dir: Path,
+    output: DatasetOutput,
+    *,
+    refetch: Callable[[], TripManifest],
+    reporter: Reporter,
+    cache_dir: Path | None,
+    present_keys: set[str] | None,
+    s3_target: tuple[str, str] | None,
+    trip_minute_total: int | None = None,
+) -> None:
+    """Deliver a chopped trip: each segment as its own trip folder, then the parent row.
+
+    Each segment ``<trip>_<LABEL>`` is a complete mini-trip — its own minute dirs,
+    fixed metadata and trip insight — with its own ledger row and marker; the
+    trip's own folder is never created. The parent row only aggregates: it ends
+    ``segmented`` when every segment is complete (or the trip has none), and is
+    otherwise partial / pending_restore / archived, so a later pass re-processes
+    the trip and delivers just the segments that are not complete yet.
+
+    The TRIPS_FILE minute selection was already applied to ``manifest``; each
+    segment keeps the selected minutes it contains, and keeps its server label.
+    """
+    trip_id, sub_trip, health_grade, _ = parent
+    name = parent.dir_name
+    labels = [segment.label for segment in manifest.segments or []]
+    if len(set(labels)) != len(labels) or not all(
+        SEGMENT_LABEL_RE.fullmatch(label) for label in labels
+    ):
+        message = f"invalid segment labels in the trip manifest: {labels}"
+        reporter.trip(
+            trip_id,
+            sub_trip,
+            health_grade,
+            TRIP_FAILED,
+            error_stage="manifest",
+            error_message=message,
+        )
+        logger.error("Trip %s skipped: %s", name, message)
+        return
+
+    units = segment_units(parent, manifest, minutes)
+    if not units:
+        if minutes is not None and manifest.segments:
+            message = (
+                f"none of the {len(minutes)} requested minute(s) fall in a segment "
+                "of this trip"
+            )
+            reporter.trip(
+                trip_id,
+                sub_trip,
+                health_grade,
+                TRIP_FAILED,
+                error_stage="minute_selection",
+                error_message=message,
+            )
+            logger.error("Trip %s skipped: %s", name, message)
+            return
+        reporter.trip(
+            trip_id,
+            sub_trip,
+            health_grade,
+            TRIP_SEGMENTED,
+            file_total=0,
+            error_message=_NO_SEGMENT_MESSAGE,
+        )
+        logger.info("Trip %s: %s; nothing to download", name, _NO_SEGMENT_MESSAGE)
+        return
+
+    # build_expected_trip_files lives in manifest_coverage, which imports this
+    # module — import lazily to avoid a circular import at load time.
+    from app.manifest_coverage import build_expected_trip_files  # noqa: PLC0415
+
+    reporter.trip(
+        trip_id,
+        sub_trip,
+        health_grade,
+        TRIP_IN_PROGRESS,
+        country=manifest.country,
+        state=manifest.state,
+        timezone=manifest.timezone,
+        file_total=sum(
+            len(build_expected_trip_files(unit, output, dry_mode=settings.dry_mode))
+            for _key, unit in units
+        ),
+        manifest_generated_at=str(manifest.manifest_generated_at),
+    )
+
+    outcomes: dict[str, tuple[str, _PendingRestore]] = {}
+    for key, unit in units:
+        if key in completed_segments:
+            outcomes[key.segment] = (TRIP_COMPLETE, _PendingRestore())
+            continue
+        try:
+            _revoke_claims(output_dir, key)
+        except OSError as exc:
+            logger.exception("Could not clear completion markers for trip %s", key.dir_name)
+            reporter.trip(
+                trip_id,
+                sub_trip,
+                health_grade,
+                TRIP_FAILED,
+                segment=key.segment,
+                error_stage="markers",
+                error_message=f"{type(exc).__name__}: {exc}",
+            )
+            outcomes[key.segment] = (TRIP_FAILED, _PendingRestore())
+            continue
+
+        def refetch_segment(label: str = key.segment) -> TripManifest | None:
+            for fresh_key, fresh_unit in segment_units(parent, refetch(), minutes):
+                if fresh_key.segment == label:
+                    return fresh_unit
+            logger.warning(
+                "Trip %s: segment %s is not in the refreshed manifest", name, label
+            )
+            return None
+
+        outcomes[key.segment] = _deliver_unit(
+            key,
+            unit,
+            output_dir,
+            output,
+            refetch=refetch_segment,
+            reporter=reporter,
+            cache_dir=cache_dir,
+            present_keys=present_keys,
+            s3_target=s3_target,
+            trip_minute_total=trip_minute_total,
+        )
+
+    statuses = {label: status for label, (status, _restoring) in outcomes.items()}
+    if all(status == TRIP_COMPLETE for status in statuses.values()):
+        reporter.trip(
+            trip_id,
+            sub_trip,
+            health_grade,
+            TRIP_SEGMENTED,
+            error_message=f"{len(statuses)} segment(s): {','.join(statuses)}",
+        )
+        return
+
+    failed = [
+        label
+        for label, status in statuses.items()
+        if status in (TRIP_FAILED, TRIP_PARTIAL)
+    ]
+    if failed:
+        message = (
+            f"{len(failed)} of {len(statuses)} segment(s) not delivered: "
+            f"{','.join(failed)}"
+        )
+        reporter.trip(
+            trip_id,
+            sub_trip,
+            health_grade,
+            TRIP_PARTIAL,
+            error_stage="segments",
+            error_message=message,
+        )
+        logger.error("Trip %s: %s; retried on a later pass", name, message)
+        return
+
+    # Every segment is complete or held by Deep Archive. The parent carries the
+    # same message shape as an unsegmented trip, so the end-of-run summary
+    # (pending_restore_stats / archived_stats) counts its files.
+    # Archived wins, as for an unsegmented trip: part of the trip will never arrive
+    # without a restore request, so "re-run after the ETA" would be wrong.
+    held = [restoring for _status, restoring in outcomes.values()]
+    restoring_files = sum(r.files for r in held)
+    if TRIP_ARCHIVED in statuses.values():
+        status, stage = TRIP_ARCHIVED, "archived"
+        message = archived_message(sum(r.archived for r in held))
+        if restoring_files > 0:
+            message += f" (+{restoring_files} file(s) awaiting archive restore)"
+    else:
+        etas = [r.max_available_at for r in held if r.max_available_at is not None]
+        status, stage = TRIP_PENDING_RESTORE, "pending_restore"
+        message = pending_restore_message(restoring_files, max(etas, default=None))
+    reporter.trip(
+        trip_id,
+        sub_trip,
+        health_grade,
+        status,
+        error_stage=stage,
+        error_message=message,
+    )
+    logger.info("Trip %s: %s; held for a later run", name, message)
+
+
+def _deliver_unit(
+    key: TripKey,
+    manifest: TripManifest,
+    output_dir: Path,
+    output: DatasetOutput,
+    *,
+    refetch: Callable[[], TripManifest | None],
+    reporter: Reporter,
+    cache_dir: Path | None,
+    present_keys: set[str] | None,
+    s3_target: tuple[str, str] | None,
+    trip_minute_total: int | None = None,
+) -> tuple[str, _PendingRestore]:
+    """Deliver one unit — a whole trip, or one segment of a chopped trip.
+
+    Everything from the expected-file list to publish/upload, reported under
+    ``key`` (its segment included). Returns the terminal status it reported and
+    the Deep-Archive tally of its last attempt (empty when it never got that far),
+    which a chopped trip's parent row aggregates. ``refetch`` returns a fresh
+    manifest for this unit, or None when there is none to retry with.
+    ``trip_minute_total`` is the whole trip's minute count: a unit with fewer
+    minutes is formatted as a partial trip (its trip-level stats recomputed).
+    """
+    # build_expected_trip_files lives in manifest_coverage, which imports this
+    # module — import lazily to avoid a circular import at load time.
+    from app.manifest_coverage import build_expected_trip_files  # noqa: PLC0415
+
+    trip_id, sub_trip, health_grade, segment = key
+    name = key.dir_name
+    nothing_held = _PendingRestore()
+
+    country, state = _get_trip_location(manifest)
     expected_rel = build_expected_trip_files(
-        trip_manifest, output, dry_mode=settings.dry_mode
+        manifest, output, dry_mode=settings.dry_mode
     )
     reporter.trip(
         trip_id,
         sub_trip,
         health_grade,
         TRIP_IN_PROGRESS,
+        segment=segment,
         country=country,
         state=state,
-        timezone=trip_manifest.timezone,
+        timezone=manifest.timezone,
         file_total=len(expected_rel),
-        manifest_generated_at=str(trip_manifest.manifest_generated_at),
+        manifest_generated_at=str(manifest.manifest_generated_at),
     )
 
-    final_dir = build_trip_directory_path(
-        output_dir, country, state, trip_id, sub_trip, health_grade
-    )
+    final_dir = build_trip_directory_path(output_dir, country, state, *key)
     final_rel = final_dir.relative_to(output_dir).as_posix()
 
     # Fast resume: if the trip is already fully on S3, mark complete without
@@ -978,26 +1262,27 @@ def process_trip(
                 expected_rel, expected_keys, present_keys
             ):
                 reporter.file(
-                    trip_id, sub_trip, health_grade, rel.as_posix(), "uploaded"
+                    trip_id,
+                    sub_trip,
+                    health_grade,
+                    rel.as_posix(),
+                    "uploaded",
+                    segment=segment,
                 )
             # No marker here. This branch decides from `present_keys`, a listing
             # taken once at start-up, and never re-checks S3: another run can have
             # rolled those very objects back since. The S3 listing is re-taken on
             # every run anyway, so it is the authority for an S3 delivery — a
             # marker would only add a claim nothing verified.
-            reporter.trip(trip_id, sub_trip, health_grade, TRIP_COMPLETE)
-            logger.debug(
-                "Trip %s_%d already complete on S3; skipped", trip_id, sub_trip
-            )
-            return
+            reporter.trip(trip_id, sub_trip, health_grade, TRIP_COMPLETE, segment=segment)
+            logger.debug("Trip %s already complete on S3; skipped", name)
+            return TRIP_COMPLETE, nothing_held
 
     # ``cache_dir`` is the caller's per-(dataset, output dir) subtree; the
     # settings default is only for callers outside app.main (tests, one-offs).
     cache_trip_dir = build_cache_trip_path(
         cache_dir if cache_dir is not None else settings.cache_dir,
-        trip_id,
-        sub_trip,
-        health_grade,
+        *key,
     )
     try:
         # A killed run may have left ``*.part`` files in THIS trip's cache dir.
@@ -1006,29 +1291,22 @@ def process_trip(
         # a start-up sweep of the whole cache tree, which on a network filesystem
         # holding a failed run's 2 TB cost hours before the first download.
         sweep_partial_files(cache_trip_dir)
-        tasks, restoring = _iter_trip_tasks(cache_trip_dir, trip_manifest, output)
+        tasks, restoring = _iter_trip_tasks(cache_trip_dir, manifest, output)
         failures = _download_trip_tasks(tasks)
         if failures:
             # Retry once with a fresh manifest in case presigned URLs expired. The
             # fresh manifest also re-checks Deep-Archive state, so `restoring` is
             # replaced with the server's current view.
             try:
-                trip_manifest = _apply_minute_selection(
-                    get_trip_manifest(
-                        api_key, dataset_id, trip_id, sub_trip, health_grade
-                    ),
-                    minutes,
-                    trip_id,
-                    sub_trip,
-                )
-                tasks, restoring = _iter_trip_tasks(
-                    cache_trip_dir, trip_manifest, output
-                )
-                failures = _download_trip_tasks(tasks)
+                fresh = refetch()
+                if fresh is not None:
+                    manifest = fresh
+                    tasks, restoring = _iter_trip_tasks(
+                        cache_trip_dir, manifest, output
+                    )
+                    failures = _download_trip_tasks(tasks)
             except Exception:
-                logger.exception(
-                    "Manifest refresh failed for trip %s_%d", trip_id, sub_trip
-                )
+                logger.exception("Manifest refresh failed for trip %s", name)
 
         # A file can be archived between the manifest check and the download — S3
         # then answers InvalidObjectState. Count it as restoring (the next manifest
@@ -1050,8 +1328,9 @@ def process_trip(
                 cache_trip_dir,
                 failures,
                 restoring_files=restoring.files,
+                segment=segment,
             )
-            return
+            return TRIP_PARTIAL, restoring
 
         if restoring.archived > 0:
             # No restore is coming for these files while the dataset opts out of
@@ -1065,17 +1344,17 @@ def process_trip(
                 sub_trip,
                 health_grade,
                 TRIP_ARCHIVED,
+                segment=segment,
                 error_stage="archived",
                 error_message=message,
             )
             logger.info(
-                "Trip %s_%d: %s; everything available is downloaded — trip held in "
+                "Trip %s: %s; everything available is downloaded — trip held in "
                 "the cache until a later run finds the files downloadable",
-                trip_id,
-                sub_trip,
+                name,
                 message,
             )
-            return
+            return TRIP_ARCHIVED, restoring
 
         if restoring.files > 0:
             message = pending_restore_message(
@@ -1086,31 +1365,38 @@ def process_trip(
                 sub_trip,
                 health_grade,
                 TRIP_PENDING_RESTORE,
+                segment=segment,
                 error_stage="pending_restore",
                 error_message=message,
             )
             logger.info(
-                "Trip %s_%d: %s; everything available is downloaded — trip held in "
+                "Trip %s: %s; everything available is downloaded — trip held in "
                 "the cache until a later run completes it",
-                trip_id,
-                sub_trip,
+                name,
                 message,
             )
-            return
+            return TRIP_PENDING_RESTORE, restoring
 
-        format_ds(trip_manifest, cache_trip_dir, output)
+        format_ds(
+            manifest,
+            cache_trip_dir,
+            output,
+            partial=trip_minute_total is not None
+            and len(manifest.minutes) < trip_minute_total,
+        )
         shutil.rmtree(build_features_directory_path(cache_trip_dir), ignore_errors=True)
     except Exception as exc:
-        logger.exception("Failed to process trip %s_%d", trip_id, sub_trip)
+        logger.exception("Failed to process trip %s", name)
         reporter.trip(
             trip_id,
             sub_trip,
             health_grade,
             TRIP_FAILED,
+            segment=segment,
             error_stage="process",
             error_message=f"{type(exc).__name__}: {exc}",
         )
-        return
+        return TRIP_FAILED, nothing_held
 
     # Validate the assembled trip in the cache BEFORE moving it into the dataset dir:
     # the whitelist stops extra files, but only validation catches missing files or a
@@ -1122,16 +1408,17 @@ def process_trip(
     try:
         trip_report = validate_trip(output_dir, cache_trip_dir, check_layout=False)
     except Exception as exc:
-        logger.exception("Validation errored for trip %s_%d", trip_id, sub_trip)
+        logger.exception("Validation errored for trip %s", name)
         reporter.trip(
             trip_id,
             sub_trip,
             health_grade,
             TRIP_FAILED,
+            segment=segment,
             error_stage="validation",
             error_message=f"{type(exc).__name__}: {exc}",
         )
-        return
+        return TRIP_FAILED, nothing_held
     if trip_report.failures:
         messages = [
             getattr(issue, "message", str(issue)) for issue in trip_report.failures
@@ -1144,17 +1431,17 @@ def process_trip(
             sub_trip,
             health_grade,
             TRIP_FAILED,
+            segment=segment,
             error_stage="validation",
             error_message=f"{len(messages)} validation failure(s): {summary}",
         )
         logger.error(
-            "Trip %s_%d failed validation (%d failure(s)); kept cache for retry, not moved: %s",
-            trip_id,
-            sub_trip,
+            "Trip %s failed validation (%d failure(s)); kept cache for retry, not moved: %s",
+            name,
             len(messages),
             summary,
         )
-        return
+        return TRIP_FAILED, nothing_held
 
     # Passed validation — publish the trip from the cache into the dataset directory.
     # Publishing REPLACES the trip directory, so any claim on it (a different
@@ -1163,54 +1450,59 @@ def process_trip(
     # have appeared since this trip started, and a failure to revoke must stop
     # the publish rather than orphan a claim on data we are about to overwrite.
     try:
-        _revoke_claims(output_dir, trip_key)
+        _revoke_claims(output_dir, key)
     except OSError as exc:
         logger.exception(
-            "Could not revoke completion markers before publishing trip %s_%d",
-            trip_id,
-            sub_trip,
+            "Could not revoke completion markers before publishing trip %s", name
         )
         reporter.trip(
             trip_id,
             sub_trip,
             health_grade,
             TRIP_FAILED,
+            segment=segment,
             error_stage="markers",
             error_message=f"{type(exc).__name__}: {exc}",
         )
-        return
+        return TRIP_FAILED, nothing_held
     try:
         _publish_trip(cache_trip_dir, final_dir, trip_id, sub_trip)
-        logger.debug("Moved trip %s_%d to %s", trip_id, sub_trip, final_dir)
+        logger.debug("Moved trip %s to %s", name, final_dir)
     except Exception as exc:
-        logger.exception(
-            "Failed to move trip %s_%d into the dataset dir", trip_id, sub_trip
-        )
+        logger.exception("Failed to move trip %s into the dataset dir", name)
         reporter.trip(
             trip_id,
             sub_trip,
             health_grade,
             TRIP_FAILED,
+            segment=segment,
             error_stage="process",
             error_message=f"{type(exc).__name__}: {exc}",
         )
-        return
+        return TRIP_FAILED, nothing_held
 
     if s3_target is None:
         for rel in _delivered_rel(expected_rel):
-            reporter.file(trip_id, sub_trip, health_grade, rel.as_posix(), "downloaded")
+            reporter.file(
+                trip_id,
+                sub_trip,
+                health_grade,
+                rel.as_posix(),
+                "downloaded",
+                segment=segment,
+            )
         markers.mark_complete(
             output_dir,
             _scope_digest(output_dir),
-            trip_key,
+            key,
             [rel.as_posix() for rel in expected_rel],
             country=country or "",
             state=state or "",
         )
-        reporter.trip(trip_id, sub_trip, health_grade, TRIP_COMPLETE)
-        return
+        reporter.trip(trip_id, sub_trip, health_grade, TRIP_COMPLETE, segment=segment)
+        return TRIP_COMPLETE, nothing_held
 
-    _upload_and_finalize(
+    status = _upload_and_finalize(
         final_dir,
         output_dir,
         trip_id,
@@ -1220,7 +1512,9 @@ def process_trip(
         s3_target,
         reporter,
         marker_digest=None,
+        segment=segment,
     )
+    return status, nothing_held
 
 
 def _upload_and_finalize(
@@ -1233,28 +1527,30 @@ def _upload_and_finalize(
     s3_target: tuple[str, str],
     reporter: Reporter,
     marker_digest: str | None = None,
-) -> None:
+    segment: str = "",
+) -> str:
     """Upload the trip all-or-nothing, then mark it complete or partial. Never raises.
 
     ``upload_trip_atomic`` guarantees S3 ends up with either 100% of the trip's
     files or none — a mid-trip failure rolls back the objects it uploaded.
+    Returns the terminal status it reported.
     """
     bucket, prefix = s3_target
+    name = TripKey(trip_id, sub_trip, health_grade, segment).dir_name
     try:
         result = upload_trip_atomic(final_dir, output_dir, bucket, prefix, expected_rel)
     except Exception as exc:
-        logger.exception(
-            "S3 upload failed for trip %s_%d; keeping local copy", trip_id, sub_trip
-        )
+        logger.exception("S3 upload failed for trip %s; keeping local copy", name)
         reporter.trip(
             trip_id,
             sub_trip,
             health_grade,
             TRIP_FAILED,
+            segment=segment,
             error_stage="s3_upload",
             error_message=f"{type(exc).__name__}: {exc}",
         )
-        return
+        return TRIP_FAILED
 
     if not result.committed:
         detail = (
@@ -1279,20 +1575,22 @@ def _upload_and_finalize(
             sub_trip,
             health_grade,
             TRIP_PARTIAL,
+            segment=segment,
             error_stage="s3_upload",
             error_message=f"{detail}; {rollback}",
         )
         logger.error(
-            "Trip %s_%d not uploaded (%s); %s, kept local",
-            trip_id,
-            sub_trip,
+            "Trip %s not uploaded (%s); %s, kept local",
+            name,
             detail,
             rollback,
         )
-        return
+        return TRIP_PARTIAL
 
     for rel in _delivered_rel(expected_rel):
-        reporter.file(trip_id, sub_trip, health_grade, rel.as_posix(), "uploaded")
+        reporter.file(
+            trip_id, sub_trip, health_grade, rel.as_posix(), "uploaded", segment=segment
+        )
     # No marker for an S3 delivery. A marker lives under the output dir, and two
     # runs of one dataset can share a bucket prefix from two different output
     # dirs: when the second run's upload fails and rolls back, it deletes the
@@ -1302,14 +1600,16 @@ def _upload_and_finalize(
     # every time. `marker_digest` stays as a seam the tests drive.
     if marker_digest is not None:
         markers.mark_complete(
-            output_dir, marker_digest, (trip_id, sub_trip, health_grade)
+            output_dir,
+            marker_digest,
+            TripKey(trip_id, sub_trip, health_grade, segment),
         )
-    reporter.trip(trip_id, sub_trip, health_grade, TRIP_COMPLETE)
+    reporter.trip(trip_id, sub_trip, health_grade, TRIP_COMPLETE, segment=segment)
     logger.debug(
-        "Uploaded all %d file(s) of trip %s_%d to s3://%s/%s",
+        "Uploaded all %d file(s) of trip %s to s3://%s/%s",
         result.uploaded,
-        trip_id,
-        sub_trip,
+        name,
         bucket,
         prefix,
     )
+    return TRIP_COMPLETE

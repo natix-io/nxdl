@@ -14,6 +14,7 @@ from .frame_data import FrameData
 from .trip_manifest import (
     MinuteManifest,
     TripManifest,
+    TripSegment,
 )
 from .trip_metadata import TripMetadata
 
@@ -32,4 +33,5 @@ __all__ = [
     "MinuteManifest",
     "TripManifest",
     "TripMetadata",
+    "TripSegment",
 ]

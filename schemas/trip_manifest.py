@@ -55,6 +55,18 @@ class MinuteManifest(BaseModel):
         return dt.strftime("%Y-%m-%d_%H-%M")
 
 
+class TripSegment(BaseModel):
+    """One run of consecutive minutes where every camera has SEI.
+
+    Sent only for a ``seiData: with_and_chop`` dataset. Labels are "A", "B", …
+    "Z", "AA", … in minute-epoch order; ``minutes`` are the same minutes the
+    top-level ``TripManifest.minutes`` carries.
+    """
+
+    label: str
+    minutes: list[MinuteManifest] = Field(default_factory=list)
+
+
 class TripManifest(BaseModel):
     trip_id: str
     sub_trip: int
@@ -70,3 +82,6 @@ class TripManifest(BaseModel):
     safety_critical: SignedFile | None = None
     ego_actions: SignedFile | None = None
     manifest_generated_at: datetime
+    # None unless the dataset requested seiData == "with_and_chop"; then a list
+    # (possibly empty) and each segment is delivered as its own trip folder.
+    segments: list[TripSegment] | None = None

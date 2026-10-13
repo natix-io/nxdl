@@ -13,6 +13,7 @@ from app.validation import _discover_trip_dirs, parse_trip_dir_name
 from schemas.dataset_request import DatasetOutput, SavedDatasetRequest
 from schemas.trip_manifest import TripManifest
 from utils.path_helpers import (
+    TripKey,
     build_camera_directory_path,
     build_camera_file_path,
     build_camera_video_path,
@@ -23,7 +24,7 @@ from utils.path_helpers import (
 )
 from utils.settings import settings
 from utils.trip_list import format_trip_key
-from utils.trip_selection import TripSelectionMap, load_trips_selection, select_minutes
+from utils.trip_selection import TripSelectionMap, load_trips_selection, segment_units
 
 
 @dataclass(slots=True)
@@ -146,7 +147,7 @@ def collect_manifest_missing_files(
     dataset_dir: Path,
     saved_request: SavedDatasetRequest,
     *,
-    trip_filter: set[tuple[str, int, int]] | None = None,
+    trip_filter: set[TripKey] | None = None,
     max_trips: int | None = None,
     uploaded_only: bool = False,
 ) -> ManifestCoverageResult:
@@ -159,6 +160,12 @@ def collect_manifest_missing_files(
     * **Which files of a trip are absent** — one trip-manifest request each, so
       ``max_trips`` samples it over the trips that are present, and the report
       says how many of how many were checked.
+
+    A chopped (``seiData: with_and_chop``) trip is on disk as one folder per
+    segment, so it counts as present when any of them is, and each fetched
+    manifest is checked unit by unit: a segment with no folder is reported
+    absent as ``<trip>_<LABEL>``, and a trip with no segment expects nothing.
+    ``trip_filter`` may name whole trips or single segments.
     """
     api_key = settings.api_key.strip()
     dataset_id = settings.dataset_id.strip()
@@ -175,6 +182,7 @@ def collect_manifest_missing_files(
         )
 
     discovered_trips = _index_discovered_trips(dataset_dir)
+    discovered_parents = {key.parent for key in discovered_trips}
     output = saved_request.request.output
     dry_mode = settings.dry_mode
 
@@ -202,13 +210,14 @@ def collect_manifest_missing_files(
         candidates = [
             trip
             for trip in candidates
-            if (trip.trip_id, trip.sub_trip, trip.health_grade) in selection
+            if TripKey(trip.trip_id, trip.sub_trip, trip.health_grade) in selection
         ]
     if trip_filter is not None:
+        filter_parents = {key.parent for key in trip_filter}
         candidates = [
             trip
             for trip in candidates
-            if (trip.trip_id, trip.sub_trip, trip.health_grade) in trip_filter
+            if TripKey(trip.trip_id, trip.sub_trip, trip.health_grade) in filter_parents
         ]
 
     # Which trips are missing entirely is answered for EVERY trip, always: the
@@ -223,12 +232,13 @@ def collect_manifest_missing_files(
     absent = [
         trip
         for trip in candidates
-        if (trip.trip_id, trip.sub_trip, trip.health_grade) not in discovered_trips
+        if TripKey(trip.trip_id, trip.sub_trip, trip.health_grade)
+        not in discovered_parents
     ]
     present = [
         trip
         for trip in candidates
-        if (trip.trip_id, trip.sub_trip, trip.health_grade) in discovered_trips
+        if TripKey(trip.trip_id, trip.sub_trip, trip.health_grade) in discovered_parents
     ]
     present.sort(key=lambda trip: (trip.trip_id, trip.sub_trip, trip.health_grade))
     absent.sort(key=lambda trip: (trip.trip_id, trip.sub_trip, trip.health_grade))
@@ -257,7 +267,7 @@ def collect_manifest_missing_files(
     # service for 25 at a time where it supports that, and falls back to one
     # request per trip where it does not. The remaining requests are still pure
     # network I/O, so they are also spread over a thread pool.
-    keys = [(t.trip_id, t.sub_trip, t.health_grade) for t in trips_to_check]
+    keys = [TripKey(t.trip_id, t.sub_trip, t.health_grade) for t in trips_to_check]
     workers = max(1, settings.manifest_fetch_workers)
     batches = [
         keys[i : i + MANIFEST_BATCH_SIZE]
@@ -281,7 +291,7 @@ def collect_manifest_missing_files(
             errors.update(failed)
 
     for ds_trip in trips_to_check:
-        trip_key = (ds_trip.trip_id, ds_trip.sub_trip, ds_trip.health_grade)
+        trip_key = TripKey(ds_trip.trip_id, ds_trip.sub_trip, ds_trip.health_grade)
         trip_manifest = manifests.get(trip_key)
 
         if trip_manifest is None:
@@ -291,50 +301,58 @@ def collect_manifest_missing_files(
             continue
 
         selected_minutes = selection.get(trip_key) if selection is not None else None
-        if selected_minutes is not None:
-            trip_manifest, _missing = select_minutes(trip_manifest, selected_minutes)
-
-        trip_dir = discovered_trips.get(trip_key)
-        if trip_dir is None:
-            # The whole trip is absent — report it once (classified by why the
-            # downloader held it) instead of enumerating every expected file as
-            # "missing".
-            statuses = _withheld_statuses(trip_manifest)
-            if "archived" in statuses:
-                archived_trips.append(format_trip_key(trip_key))
-            elif "restoring" in statuses:
-                restoring_trips.append(format_trip_key(trip_key))
-            else:
-                missing_trips.append(format_trip_key(trip_key))
-            continue
-
-        trip_rel = _relative_path(dataset_dir, trip_dir)
-        expected_files = build_expected_trip_files(
-            trip_manifest, output, dry_mode=dry_mode
-        )
-        expected_minutes = _expected_minute_dirs(trip_manifest)
-        present_minutes = _present_minute_dirs(trip_dir)
-        covered_minutes = present_minutes & expected_minutes
-
-        trip_missing_files: list[str] = []
-        for relative_file in expected_files:
-            if _is_link_path(relative_file):
+        for unit_key, unit_manifest in segment_units(
+            trip_key, trip_manifest, selected_minutes
+        ):
+            if (
+                trip_filter is not None
+                and unit_key not in trip_filter
+                and unit_key.parent not in trip_filter
+            ):
                 continue
-            if _is_expected_file_present(trip_dir, relative_file):
+            trip_dir = discovered_trips.get(unit_key)
+            if trip_dir is None:
+                if uploaded_only:
+                    continue
+                # The whole trip (or segment) is absent — report it once
+                # (classified by why the downloader held it) instead of
+                # enumerating every expected file as "missing".
+                statuses = _withheld_statuses(unit_manifest)
+                if "archived" in statuses:
+                    archived_trips.append(format_trip_key(unit_key))
+                elif "restoring" in statuses:
+                    restoring_trips.append(format_trip_key(unit_key))
+                else:
+                    missing_trips.append(format_trip_key(unit_key))
                 continue
-            trip_missing_files.append(f"{trip_rel}/{relative_file.as_posix()}")
 
-        missing_files.extend(trip_missing_files)
-
-        trip_missing_minutes = sorted(expected_minutes - present_minutes)
-        for minute_name in trip_missing_minutes:
-            missing_minutes.append(f"{trip_rel}/{minute_name}")
-
-        if trip_missing_minutes or trip_missing_files:
-            trip_summaries.append(
-                f"{trip_rel}: {len(covered_minutes)}/{len(expected_minutes)} minutes present, "
-                f"{len(trip_missing_files)} missing file(s)"
+            trip_rel = _relative_path(dataset_dir, trip_dir)
+            expected_files = build_expected_trip_files(
+                unit_manifest, output, dry_mode=dry_mode
             )
+            expected_minutes = _expected_minute_dirs(unit_manifest)
+            present_minutes = _present_minute_dirs(trip_dir)
+            covered_minutes = present_minutes & expected_minutes
+
+            trip_missing_files: list[str] = []
+            for relative_file in expected_files:
+                if _is_link_path(relative_file):
+                    continue
+                if _is_expected_file_present(trip_dir, relative_file):
+                    continue
+                trip_missing_files.append(f"{trip_rel}/{relative_file.as_posix()}")
+
+            missing_files.extend(trip_missing_files)
+
+            trip_missing_minutes = sorted(expected_minutes - present_minutes)
+            for minute_name in trip_missing_minutes:
+                missing_minutes.append(f"{trip_rel}/{minute_name}")
+
+            if trip_missing_minutes or trip_missing_files:
+                trip_summaries.append(
+                    f"{trip_rel}: {len(covered_minutes)}/{len(expected_minutes)} minutes present, "
+                    f"{len(trip_missing_files)} missing file(s)"
+                )
 
     note = "; ".join(coverage_notes) if coverage_notes else None
     if fetch_errors:
@@ -380,14 +398,13 @@ def _is_expected_file_present(trip_dir: Path, relative_file: Path) -> bool:
     return False
 
 
-def _index_discovered_trips(dataset_dir: Path) -> dict[tuple[str, int, int], Path]:
-    indexed: dict[tuple[str, int, int], Path] = {}
+def _index_discovered_trips(dataset_dir: Path) -> dict[TripKey, Path]:
+    indexed: dict[TripKey, Path] = {}
     for trip_dir in _discover_trip_dirs(dataset_dir):
         try:
-            trip_id, sub_trip, health_grade = parse_trip_dir_name(trip_dir.name)
+            indexed[parse_trip_dir_name(trip_dir.name)] = trip_dir
         except ValueError:
             continue
-        indexed[(trip_id, sub_trip, health_grade)] = trip_dir
     return indexed
 
 

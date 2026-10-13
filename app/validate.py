@@ -23,7 +23,7 @@ from app.validation import (
 )
 from app.manifest_coverage import ManifestCoverageResult, collect_manifest_missing_files
 from schemas.camera_selection import CAMERA_SELECTION
-from utils.path_helpers import resolve_camera_selection
+from utils.path_helpers import TripKey, resolve_camera_selection
 from utils.s3_dataset import (
     build_snapshot,
     dataset_root,
@@ -31,7 +31,7 @@ from utils.s3_dataset import (
     overlay_local_file,
 )
 from utils.settings import settings
-from utils.trip_list import TripKey, format_trip_key, parse_trip_line, trip_matches
+from utils.trip_list import RequestedTripKey, format_trip_key, parse_trip_line, trip_matches
 
 logging.basicConfig(
     level=logging.INFO,
@@ -58,22 +58,31 @@ class S3ReportContext:
     # Trip identity is (trip_id, sub_trip, health_grade): one dataset can contain the
     # same pair at several grades, each its own directory with its own files. Collapsing
     # to the pair would report a dataset with one grade uploaded as fully covered.
-    expected_trips: set[tuple[str, int, int]] | None = None
+    # Uploaded keys carry a segment too (a chopped trip is uploaded as one folder per
+    # segment); trip coverage compares whole trips, i.e. each key's ``.parent``.
+    expected_trips: set[TripKey] | None = None
     coverage_note: str | None = None
-    uploaded_trips: set[tuple[str, int, int]] = field(default_factory=set)
+    uploaded_trips: set[TripKey] = field(default_factory=set)
     skipped_trip_count: int = 0
 
     @property
-    def missing_trips(self) -> list[tuple[str, int, int]]:
-        if self.expected_trips is None:
-            return []
-        return sorted(self.expected_trips - self.uploaded_trips)
+    def expected_parents(self) -> set[TripKey]:
+        return {key.parent for key in self.expected_trips or ()}
 
     @property
-    def unexpected_trips(self) -> list[tuple[str, int, int]]:
+    def missing_trips(self) -> list[TripKey]:
         if self.expected_trips is None:
             return []
-        return sorted(self.uploaded_trips - self.expected_trips)
+        return sorted(
+            self.expected_parents - {key.parent for key in self.uploaded_trips}
+        )
+
+    @property
+    def unexpected_trips(self) -> list[TripKey]:
+        if self.expected_trips is None:
+            return []
+        expected = self.expected_parents
+        return sorted(key for key in self.uploaded_trips if key.parent not in expected)
 
 
 def _apply_camera_selection(
@@ -143,13 +152,13 @@ def main() -> None:
     sys.exit(_validation_exit_code(report, manifest_coverage))
 
 
-def _parse_trip_key(trip: str) -> TripKey:
-    """``--trip`` value → a requested key; an omitted grade means "any grade"."""
+def _parse_trip_key(trip: str) -> RequestedTripKey:
+    """``--trip`` value → a requested key; an omitted grade or segment means "any"."""
     parsed = parse_trip_line(trip.strip())
     if parsed is None:
         print(
             f"Invalid --trip value {trip!r}; expected "
-            "'<trip_id>_<sub_trip>[_<health_grade>]'.",
+            "'<trip_id>_<sub_trip>[_<health_grade>][_<segment>]'.",
             file=sys.stderr,
         )
         sys.exit(2)
@@ -192,7 +201,7 @@ def _validate_on_s3(
     # the manifest's trips, so trip folders from other datasets sharing the
     # prefix don't pollute the report (they'd be judged against the wrong
     # dataset request anyway).
-    parsed_trip_dirs: list[tuple[Path, tuple[str, int, int]]] = []
+    parsed_trip_dirs: list[tuple[Path, TripKey]] = []
     if root.is_dir():
         for trip_dir in _discover_trip_dirs(root):
             try:
@@ -203,7 +212,7 @@ def _validate_on_s3(
     context.uploaded_trips = {trip_key for _, trip_key in parsed_trip_dirs}
 
     trip: str | None = args.trip
-    selected_trip: TripKey | None = _parse_trip_key(trip) if trip is not None else None
+    selected_trip = _parse_trip_key(trip) if trip is not None else None
     if selected_trip is not None:
         selection = {selected_trip}
         matching = [
@@ -217,10 +226,18 @@ def _validate_on_s3(
                 file=sys.stderr,
             )
             sys.exit(2)
-        # A --trip without a grade selects every grade of that pair, so the
-        # expected/uploaded sets are the matched directories, not one key.
+        # A --trip without a grade (or segment) selects every grade (segment) of
+        # that pair, so the expected/uploaded sets are the matched directories,
+        # not one key.
         matched_keys = {trip_key for _, trip_key in matching}
-        context.expected_trips = matched_keys
+        # Without a segment the --trip names the whole trip, so coverage is asked for
+        # the whole trip (its parent key): a segment that never reached S3 then
+        # counts as missing instead of dropping out of the expected set.
+        context.expected_trips = (
+            matched_keys
+            if selected_trip[3] is not None
+            else {trip_key.parent for trip_key in matched_keys}
+        )
         context.uploaded_trips = matched_keys
         context.coverage_note = f"validation limited to trip {trip}"
         trip_dirs_to_drop = [
@@ -238,7 +255,7 @@ def _validate_on_s3(
         foreign_trip_dirs = [
             trip_dir
             for trip_dir, trip_key in parsed_trip_dirs
-            if trip_key not in context.expected_trips
+            if trip_key.parent not in context.expected_trips
         ]
         if foreign_trip_dirs:
             context.skipped_trip_count = len(foreign_trip_dirs)
@@ -265,7 +282,7 @@ def _validate_on_s3(
 def _collect_manifest_coverage(
     report: ValidationReport,
     *,
-    trip_filter: set[tuple[str, int, int]] | None,
+    trip_filter: set[TripKey] | None,
     max_trips: int | None,
     uploaded_only: bool,
 ) -> ManifestCoverageResult | None:
@@ -320,7 +337,7 @@ def _resolve_local_dataset_request() -> tuple[Path, str]:
     return local_path, f"downloaded from the API to {local_path} (not found on S3)"
 
 
-def _fetch_expected_trips() -> tuple[set[tuple[str, int, int]] | None, str | None]:
+def _fetch_expected_trips() -> tuple[set[TripKey] | None, str | None]:
     """The dataset's full trip set from the API manifest, or a note on why not."""
     api_key = settings.api_key.strip()
     dataset_id = settings.dataset_id.strip()
@@ -337,7 +354,8 @@ def _fetch_expected_trips() -> tuple[set[tuple[str, int, int]] | None, str | Non
             f"trip coverage skipped: failed to fetch the dataset manifest: {exc}",
         )
     return {
-        (trip.trip_id, trip.sub_trip, trip.health_grade) for trip in ds_manifest.trips
+        TripKey(trip.trip_id, trip.sub_trip, trip.health_grade)
+        for trip in ds_manifest.trips
     }, None
 
 
@@ -373,8 +391,9 @@ def _render_report(
         if s3_context.request_note:
             write(f"Dataset request source: {s3_context.request_note}\n")
         if s3_context.expected_trips is not None:
-            uploaded = len(s3_context.expected_trips & s3_context.uploaded_trips)
-            write(f"Trips uploaded: {uploaded} / {len(s3_context.expected_trips)}\n")
+            expected = s3_context.expected_parents
+            uploaded = len(expected - set(s3_context.missing_trips))
+            write(f"Trips uploaded: {uploaded} / {len(expected)}\n")
             if s3_context.skipped_trip_count:
                 write(
                     "Skipped trip folders from other datasets under the prefix: "
@@ -706,7 +725,9 @@ def _parse_args() -> argparse.Namespace:
         metavar="TRIP",
         help=(
             "Limit --s3 validation to a single trip '<trip_id>_<sub_trip>' under the "
-            "prefix (other trip folders are excluded from the report)."
+            "prefix (other trip folders are excluded from the report). An optional "
+            "'_<health_grade>' and/or '_<segment>' suffix narrows it to that grade "
+            "or that segment of a chopped trip."
         ),
     )
     parser.add_argument(

@@ -18,6 +18,12 @@ Format::
 * ``minutes`` absent means the whole trip. When present it is a non-empty list of
   minute folder names (``HH-MM-SS`` in the trip's local time, exactly as they appear
   in the downloaded dataset) and only those minutes are downloaded.
+
+**Chopped trips** (``seiData: with_and_chop``): an entry still names the whole trip.
+Its ``minutes`` are applied to the trip first, then each segment keeps the selected
+minutes it contains (:func:`segment_units`). Labels always come from the server and
+are never reassigned, so selecting minutes that fall only in segment B delivers just
+``<trip>_B`` — there is no ``<trip>_A``.
 """
 
 import json
@@ -28,14 +34,14 @@ from pathlib import Path
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from schemas.trip_manifest import TripManifest
-from utils.path_helpers import get_minute_dir_name
+from utils.path_helpers import TripKey, get_minute_dir_name
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_HEALTH_GRADE = 500
 
-# A concrete trip: (trip_id, sub_trip, health_grade). Value None = whole trip.
-TripSelectionMap = dict[tuple[str, int, int], frozenset[str] | None]
+# A concrete whole trip (segment ""). Value None = whole trip.
+TripSelectionMap = dict[TripKey, frozenset[str] | None]
 
 _MINUTE_NAME_RE = re.compile(r"^\d{2}-\d{2}-\d{2}$")
 
@@ -65,8 +71,8 @@ class TripSelection(BaseModel):
         return sorted(set(minutes))
 
     @property
-    def key(self) -> tuple[str, int, int]:
-        return self.trip_id, self.sub_trip, self.health_grade
+    def key(self) -> TripKey:
+        return TripKey(self.trip_id, self.sub_trip, self.health_grade)
 
 
 class TripsFile(BaseModel):
@@ -76,7 +82,7 @@ class TripsFile(BaseModel):
 
 
 def load_trips_selection(trips_file: Path) -> TripSelectionMap:
-    """Parse ``trips_file`` into ``{(trip_id, sub_trip, health_grade): minutes | None}``.
+    """Parse ``trips_file`` into ``{TripKey(trip_id, sub_trip, health_grade): minutes | None}``.
 
     Order is preserved. Raises ``FileNotFoundError`` if the file is missing and
     ``ValueError`` (with a readable message) if it is not valid JSON, does not match
@@ -128,3 +134,33 @@ def select_minutes(
             found.add(name)
     missing = sorted(minutes - found)
     return manifest.model_copy(update={"minutes": kept}), missing
+
+
+def segment_units(
+    parent: TripKey, manifest: TripManifest, minutes: frozenset[str] | None = None
+) -> list[tuple[TripKey, TripManifest]]:
+    """The units trip ``parent`` is delivered as: ``[(key, manifest), ...]``.
+
+    An unsegmented trip (``manifest.segments is None``) is one unit, keyed on
+    ``parent``. A chopped trip is one unit per segment, keyed on ``parent`` with
+    the segment's label, whose manifest holds only that segment's minutes (and no
+    segments). Keys come from ``parent`` — the trip that was asked for — exactly
+    as an unsegmented trip's directory always has, never from the manifest body.
+
+    ``minutes`` is the TRIPS_FILE minute selection for the trip: each unit keeps
+    only the selected minutes, matched by folder name. A segment left with no
+    minutes is dropped — labels are the server's and are never reassigned.
+    """
+    if manifest.segments is None:
+        if minutes is not None:
+            manifest, _missing = select_minutes(manifest, minutes)
+        return [(parent, manifest)]
+
+    units: list[tuple[TripKey, TripManifest]] = []
+    for segment in manifest.segments:
+        unit = manifest.model_copy(update={"minutes": segment.minutes, "segments": None})
+        if minutes is not None:
+            unit, _missing = select_minutes(unit, minutes)
+        if unit.minutes:
+            units.append((parent._replace(segment=segment.label), unit))
+    return units

@@ -8,7 +8,12 @@ filesystems, which is exactly where these datasets live (GPFS, Lustre, NFS).
 
 So completion is *also* recorded as one empty file per finished trip:
 
-    <output_dir>/.natix/done/<scope_digest>/<trip_id>_<sub_trip>_<grade>
+    <output_dir>/.natix/done/<scope_digest>/<trip_id>_<sub_trip>_<grade>[_<segment>]
+
+The grade is always spelled out. The ``_<segment>`` suffix is present only for one
+segment of a chopped (``seiData: with_and_chop``) trip, which is delivered — and
+certified — as its own folder; every other marker keeps the three-part name it
+has always had, so markers written before segments existed still parse.
 
 Every operation is a direct path op — ``open(O_CREAT|O_EXCL)``, ``unlink``,
 ``scandir`` of one directory — all of which are atomic on network filesystems,
@@ -32,6 +37,7 @@ from pathlib import Path
 from urllib.parse import quote, unquote
 
 from utils.ledger import LegacyCompletion
+from utils.path_helpers import SEGMENT_LABEL_RE, TripKey, _segment_suffix
 
 logger = logging.getLogger(__name__)
 
@@ -47,8 +53,10 @@ def markers_root(output_dir: Path, state_dirname: str = ".natix") -> Path:
     return output_dir / state_dirname / MARKERS_DIRNAME
 
 
-def trip_key_name(trip_id: str, sub_trip: int, health_grade: int) -> str:
-    """Filename for one trip's marker. Mirrors the ledger's three-part key.
+def trip_key_name(
+    trip_id: str, sub_trip: int, health_grade: int, segment: str = ""
+) -> str:
+    """Filename for one trip's (or segment's) marker. Mirrors the ledger's key.
 
     Percent-encoded, not sanitised. ``safe_name`` maps several characters onto
     ``_``, so ``a+b`` and ``a_b`` produce the same filename and reading it back
@@ -57,17 +65,30 @@ def trip_key_name(trip_id: str, sub_trip: int, health_grade: int) -> str:
     comes back is the key that went in, and a UUID (what these ids are in
     practice) is left exactly as it is.
     """
-    return f"{quote(trip_id, safe='')}_{int(sub_trip)}_{int(health_grade)}"
+    return (
+        f"{quote(trip_id, safe='')}_{int(sub_trip)}_{int(health_grade)}"
+        f"{_segment_suffix(segment)}"
+    )
 
 
-def parse_key_name(name: str) -> tuple[str, int, int] | None:
-    """Inverse of :func:`trip_key_name`; ``None`` for anything else in the dir."""
-    parts = name.rsplit("_", 2)
+def parse_key_name(name: str) -> TripKey | None:
+    """Inverse of :func:`trip_key_name`; ``None`` for anything else in the dir.
+
+    ``quote`` leaves ``_`` unencoded, so a trip_id can contain underscores and
+    the name is split from the right. The grade is always present and numeric,
+    so an alphabetic last part can only be a segment label.
+    """
+    parts = name.rsplit("_", 3)
+    segment = ""
+    if len(parts) == 4 and SEGMENT_LABEL_RE.fullmatch(parts[3]):
+        segment = parts.pop()
+    else:
+        parts = name.rsplit("_", 2)
     if len(parts) != 3:
         return None
     trip_id, sub_trip, health_grade = parts
     try:
-        return unquote(trip_id), int(sub_trip), int(health_grade)
+        return TripKey(unquote(trip_id), int(sub_trip), int(health_grade), segment)
     except ValueError:
         return None
 
@@ -81,12 +102,12 @@ def scope_digests(output_dir: Path) -> list[str]:
         return [e.name for e in entries if not e.name.startswith(".") and e.is_dir()]
 
 
-def completed_keys(output_dir: Path, digest: str) -> set[tuple[str, int, int]]:
+def completed_keys(output_dir: Path, digest: str) -> set[TripKey]:
     """Trip keys this scope has published into this output dir. One scandir."""
     scope_dir = markers_root(output_dir) / digest
     if not scope_dir.is_dir():
         return set()
-    keys: set[tuple[str, int, int]] = set()
+    keys: set[TripKey] = set()
     with os.scandir(scope_dir) as entries:
         for entry in entries:
             if entry.name.startswith("."):
@@ -128,8 +149,8 @@ def existing_trip_dir_names(output_dir: Path) -> set[str]:
 
 
 def drop_markers_without_a_directory(
-    output_dir: Path, digest: str, keys: set[tuple[str, int, int]]
-) -> set[tuple[str, int, int]]:
+    output_dir: Path, digest: str, keys: set[TripKey]
+) -> set[TripKey]:
     """Return the markers still backed by a trip directory; unlink the rest.
 
     A marker certifies a delivery; if someone removed the trip's directory by
@@ -138,15 +159,13 @@ def drop_markers_without_a_directory(
     directory's existence, from the region-level listings above — one name
     lookup per marker, no stat per trip.
     """
-    from utils.path_helpers import build_trip_directory_path  # noqa: PLC0415
-
     if not keys:
         return keys
     present = existing_trip_dir_names(output_dir)
-    backed: set[tuple[str, int, int]] = set()
-    stale: list[tuple[str, int, int]] = []
+    backed: set[TripKey] = set()
+    stale: list[TripKey] = []
     for key in keys:
-        name = build_trip_directory_path(Path("."), "", "", *key).name
+        name = key.dir_name
         if name in present:
             backed.add(key)
         else:
@@ -169,7 +188,7 @@ def drop_markers_without_a_directory(
 def mark_complete(
     output_dir: Path,
     digest: str,
-    key: tuple[str, int, int],
+    key: TripKey,
     files: "list[str] | tuple[str, ...]" = (),
     *,
     country: str = "",
@@ -219,7 +238,7 @@ def mark_complete(
 
 
 def marker_evidence(
-    output_dir: Path, digest: str, key: tuple[str, int, int]
+    output_dir: Path, digest: str, key: TripKey
 ) -> tuple[str, str, list[str]]:
     """``(country, state, trip-relative files)`` a marker records.
 
@@ -238,14 +257,12 @@ def marker_evidence(
     return country, state, lines
 
 
-def marker_files(output_dir: Path, digest: str, key: tuple[str, int, int]) -> list[str]:
+def marker_files(output_dir: Path, digest: str, key: TripKey) -> list[str]:
     """The trip-relative files a marker records; empty for a marker that has none."""
     return marker_evidence(output_dir, digest, key)[2]
 
 
-def invalidate_claims(
-    output_dir: Path, key: tuple[str, int, int], digests: list[str]
-) -> None:
+def invalidate_claims(output_dir: Path, key: TripKey, digests: list[str]) -> None:
     """Revoke the listed scopes' claims on ``key``, before its directory changes.
 
     ``_publish_trip`` overwrites the trip directory, so whatever another scope
@@ -274,7 +291,7 @@ def is_migrated(output_dir: Path) -> bool:
 
 def import_legacy_ledgers(
     output_dir: Path,
-    ledgers: "list[tuple[str, dict[tuple[str, int, int], LegacyCompletion], set[tuple[str, int, int]]]]",
+    ledgers: "list[tuple[str, dict[TripKey, LegacyCompletion], set[TripKey]]]",
 ) -> int:
     """One-shot, output-wide import of pre-marker resume state.
 
@@ -313,7 +330,7 @@ def import_legacy_ledgers(
     """
     root = markers_root(output_dir)
     root.mkdir(parents=True, exist_ok=True)
-    contested: set[tuple[str, int, int]] = set()
+    contested: set[TripKey] = set()
     for digest, delivered, _mentioned in ledgers:
         for other_digest, _other, other_mentioned in ledgers:
             if other_digest == digest:

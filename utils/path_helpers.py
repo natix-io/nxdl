@@ -3,6 +3,7 @@ import re
 import os
 from datetime import datetime
 from pathlib import Path
+from typing import NamedTuple
 from urllib.parse import unquote, urlparse
 from zoneinfo import ZoneInfo
 
@@ -51,6 +52,73 @@ def _health_grade_suffix(health_grade: int) -> str:
     return "" if health_grade == 500 else f"_{health_grade}"
 
 
+# A segment label of a ``seiData: with_and_chop`` trip: "A", "B", … "Z", "AA", …
+# Alphabetic on purpose, so a trailing segment can never be read as a grade:
+# ``abc_1_1`` is still grade 1, ``abc_1_A`` is segment A.
+SEGMENT_LABEL_RE = re.compile(r"[A-Z]+")
+
+
+def _segment_suffix(segment: str) -> str:
+    """``_<label>`` for a segment of a chopped trip; nothing for a whole trip."""
+    return f"_{segment}" if segment else ""
+
+
+class TripKey(NamedTuple):
+    """One delivered unit: ``(trip_id, sub_trip, health_grade, segment)``.
+
+    ``segment`` is ``""`` for a whole trip — every trip outside a
+    ``seiData: with_and_chop`` dataset — and a label (``"A"``, ``"B"``, …) for one
+    segment of a chopped trip, which is delivered as its own sibling folder.
+
+    Compare keys only with keys: a plain 3-tuple is never equal to a TripKey, so
+    one leftover 3-tuple silently breaks set and dict membership.
+    """
+
+    trip_id: str
+    sub_trip: int
+    health_grade: int = 500
+    segment: str = ""
+
+    @property
+    def parent(self) -> "TripKey":
+        """The whole trip a segment belongs to (itself for an unsegmented key)."""
+        return self._replace(segment="")
+
+    @property
+    def dir_name(self) -> str:
+        return (
+            f"{self.trip_id}_{self.sub_trip}"
+            f"{_health_grade_suffix(self.health_grade)}{_segment_suffix(self.segment)}"
+        )
+
+
+# Non-greedy trip_id so a trailing ``_<health_grade>`` is not swallowed into
+# sub_trip; the segment label is alphabetic so it never competes with the grade.
+TRIP_DIR_RE = re.compile(
+    r"(?P<trip_id>.+?)_(?P<sub_trip>\d+)(?:_(?P<health_grade>\d+))?"
+    r"(?:_(?P<segment>[A-Z]+))?$"
+)
+
+
+def parse_trip_dir_name(name: str) -> TripKey:
+    """Parse a trip folder/line name into a :class:`TripKey`.
+
+    health_grade defaults to 500 (unsuffixed = grade-500, matching the
+    server's health_grade_suffix() convention) and segment to ``""`` (a whole
+    trip). Raises ValueError if unparseable.
+    """
+    match = TRIP_DIR_RE.fullmatch(name)
+    if not match:
+        raise ValueError(f"Cannot parse trip directory name: {name!r}")
+    health_grade = match.group("health_grade")
+    return TripKey(
+        match.group("trip_id"),
+        int(match.group("sub_trip")),
+        int(health_grade) if health_grade is not None else 500,
+        match.group("segment") or "",
+    )
+
+
 def build_trip_directory_path(
     output_base: Path,
     country: str,
@@ -58,6 +126,7 @@ def build_trip_directory_path(
     trip_id: str,
     sub_trip: int,
     health_grade: int = 500,
+    segment: str = "",
 ) -> Path:
     output_dir = output_base
     if country:
@@ -69,7 +138,7 @@ def build_trip_directory_path(
             output_dir = output_dir / state
         else:
             output_dir = output_dir / "unknown"
-    return output_dir / f"{trip_id}_{sub_trip}{_health_grade_suffix(health_grade)}"
+    return output_dir / TripKey(trip_id, sub_trip, health_grade, segment).dir_name
 
 
 def build_minute_directory_path(
@@ -161,10 +230,14 @@ def build_dataset_cache_path(
 
 
 def build_cache_trip_path(
-    cache_base: Path, trip_id: str, sub_trip: int, health_grade: int = 500
+    cache_base: Path,
+    trip_id: str,
+    sub_trip: int,
+    health_grade: int = 500,
+    segment: str = "",
 ) -> Path:
-    """Flat cache path for a trip — no country/state nesting."""
-    return cache_base / f"{trip_id}_{sub_trip}{_health_grade_suffix(health_grade)}"
+    """Flat cache path for a trip (or one segment of it) — no country/state nesting."""
+    return cache_base / TripKey(trip_id, sub_trip, health_grade, segment).dir_name
 
 
 def get_camera_type(camera_type: str):

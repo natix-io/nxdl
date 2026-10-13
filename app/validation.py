@@ -16,15 +16,16 @@ from schemas.dataset_request import (
     SEIDataOptions,
 )
 from schemas.trip_metadata import CAMERA_TYPE
+# TRIP_DIR_RE / parse_trip_dir_name live in utils.path_helpers (shared with
+# utils.trip_list and the ledger); re-exported here for existing importers.
 from utils.path_helpers import (
+    TRIP_DIR_RE,
     allowed_camera_types_for_selection,
+    parse_trip_dir_name,
     resolve_camera_selection,
 )
 from utils.settings import settings
 
-TRIP_DIR_RE = re.compile(
-    r"(?P<trip_id>.+?)_(?P<sub_trip>\d+)(?:_(?P<health_grade>\d+))?$"
-)
 MINUTE_DIR_RE = re.compile(r"\d{2}-\d{2}-\d{2}$")
 VIDEO_LINK_SUFFIX = ".mp4.link"
 EXPECTED_CAMERA_DIR_NAMES = {
@@ -109,24 +110,6 @@ def scan_dir(directory: Path) -> list[DirEntryInfo]:
     return infos
 
 
-def parse_trip_dir_name(name: str) -> tuple[str, int, int]:
-    """Parse a trip folder/line name into (trip_id, sub_trip, health_grade).
-
-    health_grade defaults to 500 (unsuffixed = grade-500, matching the
-    server's health_grade_suffix() convention). Raises ValueError if
-    unparseable.
-    """
-    match = TRIP_DIR_RE.fullmatch(name)
-    if not match:
-        raise ValueError(f"Cannot parse trip directory name: {name!r}")
-    health_grade = match.group("health_grade")
-    return (
-        match.group("trip_id"),
-        int(match.group("sub_trip")),
-        int(health_grade) if health_grade is not None else 500,
-    )
-
-
 @dataclass(slots=True)
 class ValidationIssue:
     message: str
@@ -177,7 +160,9 @@ def validation_policies_from_request(
     # output on its own — output.footage.sei / .fused_sei gate the requirement.
     raw_policy: SeiPolicy = "none"
     if trips is not None and footage.sei is not None:
-        if trips.seiData == SEIDataOptions.all_data:
+        # with_and_chop delivers each all-SEI run as its own segment folder, so
+        # every minute of every delivered folder carries SEI.
+        if trips.seiData in (SEIDataOptions.all_data, SEIDataOptions.with_and_chop):
             raw_policy = "each-minute"
         elif trips.seiData == SEIDataOptions.with_data:
             raw_policy = "any-minute"
@@ -735,7 +720,7 @@ def _validate_trip_dir(
     camera_selection = resolve_camera_selection(camera_selection)
 
     try:
-        _, _, health_grade = parse_trip_dir_name(trip_dir.name)
+        health_grade = parse_trip_dir_name(trip_dir.name).health_grade
     except ValueError:
         # Shouldn't happen — trip_dir names come from our own naming scheme —
         # but don't let a malformed name crash the whole validation run.

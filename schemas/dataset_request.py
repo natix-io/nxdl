@@ -40,6 +40,9 @@ class SEIDataOptions(StrEnum):
     with_data = "with"
     without = "without"
     all_data = "all"
+    # Trips are chopped into segments where every camera has SEI; the trip
+    # manifest then carries `segments` (see schemas.trip_manifest.TripSegment).
+    with_and_chop = "with_and_chop"
 
 
 class SafetyCriticalEventsFilter(BaseModel):

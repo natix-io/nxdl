@@ -74,8 +74,9 @@ To download only some trips of the dataset — and, per trip, optionally only so
 ```
 
 - `trip_id` and `sub_trip` are required. `health_grade` is optional and defaults to `500`; a dataset can hold the same trip at several grades, and each grade is a separate trip with its own minutes.
-- `minutes` is optional: leave it out to download the whole trip. When present it must be a non-empty list of minute folder names (`HH-MM-SS`, local time — exactly as they appear in the dataset), and only those minutes are downloaded. The dataset layout is unchanged; the trip simply has fewer minute folders, and its `trip_insight.json` only describes the minutes on disk (trip-level totals such as duration and distance still cover the whole trip).
+- `minutes` is optional: leave it out to download the whole trip. When present it must be a non-empty list of minute folder names (`HH-MM-SS`, local time — exactly as they appear in the dataset), and only those minutes are downloaded. The dataset layout is unchanged; the trip simply has fewer minute folders, and its `trip_insight.json` only describes the minutes on disk, trip-level stats included (see [Dataset layout](#dataset-layout)).
 - A trip not in the dataset, or a minute not in its trip, is reported and skipped. A trip whose listed minutes all fail to match is skipped entirely.
+- In an SEI-segment dataset, list the trip itself, not a segment. Its `minutes` apply to the whole trip first, then each segment keeps the selected minutes it contains; a segment left with none is not delivered, and the letters are never reassigned (selecting only minutes of segment B delivers `abc_1_B` alone).
 - Pass the same `--trips-file` to `./validate.sh` so the QA check expects only the selected content.
 - Changing the `minutes` of a trip that an earlier run already completed has no effect on a re-run: delete that trip's folder first.
 
@@ -88,6 +89,14 @@ To get an overview of the safety-critical events in what was downloaded, add `--
 This writes `safety_critical_events_manifest.json` into the dataset root after the download: for every trip, the events of each downloaded minute folder, nested the same way as the dataset (`country / state / trip / minutes`), plus a summary. It covers exactly the minutes on disk, so with `--trips-file` it describes the selected minutes only.
 
 Run `./run.sh --help` for the full usage.
+
+### Dataset layout
+
+Each trip is a folder `<country>/[<state>/]<trip_id>_<sub_trip>[_<health_grade>][_<segment>]`; the state level is used only for the United States. `_<health_grade>` is left out for grade 500, so `abc_1` is grade 500 and `abc_1_150` is grade 150.
+
+`_<segment>` appears only in datasets requested as SEI segments (`seiData: "with_and_chop"`). Such a dataset delivers every run of consecutive minutes in which each camera has SEI as a separate folder: `abc_1_A`, `abc_1_B`, … (`abc_1_150_A` at grade 150), lettered in time order. Each segment folder is a complete trip of its own: only that segment's minute folders, its own `fixed_metadata`, and a `trip_insight.json` for those minutes only. A segmented trip has no `abc_1` folder, and a trip without any such run is skipped and logged, not reported as a failure.
+
+When a folder holds only part of a trip (a segment, or a minute selection from `--trips-file`), the trip-level fields of `trip_insight.json` → `base_insights` describe that folder, not the whole trip: `startEpochMs` / `endEpochMs` / `duration` from its minutes, and `estimatedDistance` (km), `estimatedAverageSpeed` (km/h) and `firstLocation` from the GPS in its telemetry. The GPS fields are `null` when the folder has no GPS telemetry.
 
 ### Re-running and running several datasets
 

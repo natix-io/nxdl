@@ -14,7 +14,7 @@ from pathlib import Path
 from queue import Empty, Full
 
 from schemas import DatasetOutput
-from schemas.dataset_request import DatasetRequest
+from schemas.dataset_request import DatasetRequest, SEIDataOptions
 from app.event_manifest import write_event_manifest
 from app.trip_downloader import (
     get_dataset_request,
@@ -24,14 +24,19 @@ from app.trip_downloader import (
 )
 from utils import ledger, markers
 from utils.ledger import LedgerWriter, Reporter, connect
-from utils.path_helpers import FEATURES_DIRNAME, build_dataset_cache_path, safe_name
+from utils.path_helpers import (
+    FEATURES_DIRNAME,
+    TripKey,
+    build_dataset_cache_path,
+    safe_name,
+)
 from utils.s3_uploader import (
     parse_s3_uri,
     prune_empty_region_dirs,
     upload_and_remove_file,
 )
 from utils.settings import settings
-from utils.trip_list import TripKey, format_trip_key, trip_matches
+from utils.trip_list import RequestedTripKey, format_trip_key, trip_matches
 from utils.trip_selection import load_trips_selection
 
 logger = logging.getLogger(__name__)
@@ -263,9 +268,7 @@ def _import_legacy_ledgers_once(output_dir: Path, db_path: Path) -> None:
         )
 
 
-def _dedupe_trips(
-    trips: list[tuple[str, int, int]], dataset_id: str
-) -> list[tuple[str, int, int]]:
+def _dedupe_trips(trips: list[TripKey], dataset_id: str) -> list[TripKey]:
     """Drop repeated trip keys from the dataset manifest, keeping the first.
 
     The service can list the same ``(trip_id, sub_trip, health_grade)`` twice in
@@ -274,8 +277,8 @@ def _dedupe_trips(
     two workers would download the same files into the same cache dir and race
     to publish into the same folder.
     """
-    seen: set[tuple[str, int, int]] = set()
-    unique: list[tuple[str, int, int]] = []
+    seen: set[TripKey] = set()
+    unique: list[TripKey] = []
     for trip in trips:
         if trip in seen:
             continue
@@ -294,9 +297,9 @@ def _dedupe_trips(
 
 
 def _unmatched_requested_trips(
-    all_trips: list[tuple[str, int, int]],
-    requested: list[TripKey],
-) -> list[TripKey]:
+    all_trips: list[TripKey],
+    requested: list[RequestedTripKey],
+) -> list[RequestedTripKey]:
     """Requested TRIPS_FILE keys that no trip in the dataset satisfies."""
     return [
         trip
@@ -306,9 +309,9 @@ def _unmatched_requested_trips(
 
 
 def _filter_requested_trips(
-    all_trips: list[tuple[str, int, int]],
-    requested: list[TripKey],
-) -> list[tuple[str, int, int]]:
+    all_trips: list[TripKey],
+    requested: list[RequestedTripKey],
+) -> list[TripKey]:
     """Keep only trips selected by TRIPS_FILE.
 
     Keys come from ``utils.trip_selection`` and are concrete (an entry without a
@@ -319,12 +322,12 @@ def _filter_requested_trips(
 
 
 def _filter_pending_trips(
-    all_trips: list[tuple[str, int, int]],
-    done: set[tuple[str, int, int]],
-) -> list[tuple[str, int, int]]:
-    """Keep only trips not yet marked complete in the ledger.
+    all_trips: list[TripKey],
+    done: set[TripKey],
+) -> list[TripKey]:
+    """Keep only trips not yet marked complete (or segmented) in the ledger.
 
-    The comparison is on the whole ``(trip_id, sub_trip, health_grade)`` key: one
+    The comparison is on the whole ``TripKey``: one
     dataset can hold the same pair at several grades, and each is a separate trip
     with its own files. Matching on the pair alone would drop every other grade as
     soon as one of them completed — a silent loss on resume.
@@ -333,9 +336,9 @@ def _filter_pending_trips(
 
 
 def _filter_retryable_trips(
-    pending: list[tuple[str, int, int]],
-    waiting: set[tuple[str, int, int]],
-) -> list[tuple[str, int, int]]:
+    pending: list[TripKey],
+    waiting: set[TripKey],
+) -> list[TripKey]:
     """Drop trips whose only blocker is a Deep-Archive restore.
 
     A restore takes hours (~12h standard / ~48h bulk tier), so an in-run retry
@@ -508,8 +511,8 @@ def _guard_single_dataset(output_dir: Path, dataset_id: str) -> bool:
 
 
 def _unverified_completions(
-    done: set[tuple[str, int, int]],
-    in_scope: set[tuple[str, int, int]],
+    done: set[TripKey],
+    in_scope: set[TripKey],
     s3_target: tuple[str, str] | None,
     present_keys: set[str] | None,
 ) -> int:
@@ -546,7 +549,8 @@ def _drop_completions_over_an_empty_dir(conn, output_dir: Path) -> None:
         return
     # Through ``drop_completions``, not a bare DELETE: the completion's file rows
     # key on the trip alone, so ones left behind here are re-attached to the next
-    # completion of the same trip and disprove it too.
+    # completion of the same trip and disprove it too. A ``segmented`` parent has
+    # no directory of its own and is not judged here; it goes with its segments.
     dropped = ledger.drop_completions(conn, ledger.completed_trip_keys(conn))
     if dropped:
         logger.warning(
@@ -842,7 +846,8 @@ def _trip_worker(
     worker_lock: Path,
     parent_pid: int,
     locking_required: bool,
-    minute_selection: dict[tuple[str, int, int], frozenset[str]] | None = None,
+    minute_selection: dict[TripKey, frozenset[str]] | None = None,
+    completed_segments: frozenset[TripKey] = frozenset(),
 ) -> None:
     # Before any work: hold the shared worker lock, so a run that starts after
     # this process's parent dies cannot run recovery over files still being
@@ -864,6 +869,7 @@ def _trip_worker(
             reporter,
             parent_pid,
             minute_selection,
+            completed_segments,
         )
     finally:
         # Every way out of the loop passes here, and the sentinel is one of them:
@@ -890,7 +896,8 @@ def _worker_loop(
     s3_target: tuple[str, str] | None,
     reporter: Reporter,
     parent_pid: int,
-    minute_selection: dict[tuple[str, int, int], frozenset[str]] | None = None,
+    minute_selection: dict[TripKey, frozenset[str]] | None = None,
+    completed_segments: frozenset[TripKey] = frozenset(),
 ) -> None:
     while True:
         # The lock alone leaves a window: between being started and taking it,
@@ -921,7 +928,7 @@ def _worker_loop(
             continue
         if task is None:
             break
-        trip_id, sub_trip, health_grade = task
+        trip_id, sub_trip, health_grade, _segment = task
         process_trip(
             api_key,
             dataset_id,
@@ -935,12 +942,13 @@ def _worker_loop(
             s3_target=s3_target,
             health_grade=health_grade,
             minutes=(minute_selection or {}).get(task),
+            completed_segments=completed_segments,
         )
 
 
 def _feed_queue(
     task_queue: Queue,
-    trips: list[tuple[str, int, int]],
+    trips: list[TripKey],
     workers: list[Process],
 ) -> bool:
     """Feed ``trips`` then one ``None`` sentinel per worker onto a bounded queue.
@@ -949,7 +957,7 @@ def _feed_queue(
     once full, so with no consumer it would never return. Returns ``False`` (and logs)
     if every worker died while the queue was full, instead of blocking forever.
     """
-    items: list[tuple[str, int, int] | None] = [*trips, *([None] * len(workers))]
+    items: list[TripKey | None] = [*trips, *([None] * len(workers))]
     for index, item in enumerate(items):
         while True:
             try:
@@ -970,7 +978,7 @@ def _feed_queue(
 
 
 def _run_pass(
-    trips: list[tuple[str, int, int]],
+    trips: list[TripKey],
     *,
     api_key: str,
     dataset_id: str,
@@ -979,7 +987,8 @@ def _run_pass(
     dataset_output: DatasetOutput,
     present_keys: set[str] | None,
     s3_target: tuple[str, str] | None,
-    minute_selection: dict[tuple[str, int, int], frozenset[str]],
+    minute_selection: dict[TripKey, frozenset[str]],
+    completed_segments: frozenset[TripKey],
     total_trips: int,
     worker_count: int,
     db_path: Path,
@@ -1007,6 +1016,7 @@ def _run_pass(
                 os.getpid(),
                 locking_required,
                 minute_selection,
+                completed_segments,
             ),
         )
         for _ in range(worker_count)
@@ -1115,6 +1125,13 @@ def main() -> None:
 
     dataset_request_model = DatasetRequest.model_validate(dataset_request.request)
     dataset_output: DatasetOutput = dataset_request_model.output
+    trip_filters = dataset_request_model.filters.trips
+    if trip_filters is not None and trip_filters.seiData == SEIDataOptions.with_and_chop:
+        logger.info(
+            "Dataset %s requests seiData=with_and_chop: each trip is delivered as one "
+            "folder per SEI segment (<trip>_A, <trip>_B, ...), never as one folder",
+            dataset_id,
+        )
 
     if not ds_manifest.trips:
         logger.info("No trips found for dataset %s", dataset_id)
@@ -1136,14 +1153,17 @@ def main() -> None:
         _guard_single_dataset_on_s3(s3_target, dataset_id, present_keys)
 
     all_trips = _dedupe_trips(
-        [(trip.trip_id, trip.sub_trip, trip.health_grade) for trip in ds_manifest.trips],
+        [
+            TripKey(trip.trip_id, trip.sub_trip, trip.health_grade)
+            for trip in ds_manifest.trips
+        ],
         dataset_id,
     )
 
     # Optional subset: process only the trips (and, per trip, optionally only the
     # minutes) listed in the JSON TRIPS_FILE. Minute names are resolved against
     # each trip's manifest inside process_trip.
-    minute_selection: dict[tuple[str, int, int], frozenset[str]] = {}
+    minute_selection: dict[TripKey, frozenset[str]] = {}
     if settings.trips_file.strip():
         trips_path = Path(settings.trips_file).expanduser()
         try:
@@ -1154,7 +1174,7 @@ def main() -> None:
         except ValueError as exc:
             logger.error("TRIPS_FILE is invalid: %s", exc)
             sys.exit(1)
-        requested: list[TripKey] = list(selection.keys())
+        requested: list[RequestedTripKey] = list(selection.keys())
         minute_selection = {
             key: minutes for key, minutes in selection.items() if minutes is not None
         }
@@ -1252,7 +1272,11 @@ def main() -> None:
     )
     if must_verify:
         ledger.verification_done(conn)
-    done = ledger.completed_trip_keys(conn)
+    # A chopped trip is done when its parent row is `segmented`; its segments'
+    # own complete rows are never in `in_scope` (whole trips), so they do not count.
+    complete_keys = ledger.completed_trip_keys(conn)
+    done = complete_keys | ledger.segmented_trip_keys(conn)
+    completed_segments = frozenset(key for key in complete_keys if key.segment)
     conn.close()
     unverified = _unverified_completions(done, in_scope, s3_target, present_keys)
     pending = _filter_pending_trips(all_trips, done)
@@ -1279,6 +1303,7 @@ def main() -> None:
             present_keys=present_keys,
             s3_target=s3_target,
             minute_selection=minute_selection,
+            completed_segments=completed_segments,
             total_trips=total,
             worker_count=worker_count,
             db_path=db_path,
@@ -1287,7 +1312,9 @@ def main() -> None:
         )
 
         conn = connect(db_path)
-        done = ledger.completed_trip_keys(conn)
+        complete_keys = ledger.completed_trip_keys(conn)
+        done = complete_keys | ledger.segmented_trip_keys(conn)
+        completed_segments = frozenset(key for key in complete_keys if key.segment)
         # Both hold-states are excluded from IN-RUN retries only: a restore takes
         # hours, and an archived verdict only changes when the dataset is edited
         # server-side — re-fetching seconds later helps neither. A future run of

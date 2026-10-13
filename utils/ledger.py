@@ -17,13 +17,21 @@ Resume works from two independent signals:
   is enqueued, each worker finds its files already on S3 and marks the trip
   complete without downloading anything.
 
-A trip is identified by ``(trip_id, sub_trip, health_grade)`` — all three, always.
-One dataset can contain the same ``(trip_id, sub_trip)`` at several health grades
-(a ``healthGrade: {min, max}`` request returns one row per grade, and those grades
-hold genuinely different content), so a pair-only key lets one grade's completion
-mask the others and silently drops them on resume. Grade 500 is the legacy value —
-what the service reports for trips generated before health grades existed — and is
-rendered without a directory suffix.
+A trip is identified by ``(trip_id, sub_trip, health_grade, segment)`` — all four,
+always (``utils.path_helpers.TripKey``). One dataset can contain the same
+``(trip_id, sub_trip)`` at several health grades (a ``healthGrade: {min, max}``
+request returns one row per grade, and those grades hold genuinely different
+content), so a pair-only key lets one grade's completion mask the others and
+silently drops them on resume. Grade 500 is the legacy value — what the service
+reports for trips generated before health grades existed — and is rendered without
+a directory suffix.
+
+``segment`` is ``""`` for a whole trip. A ``seiData: with_and_chop`` dataset
+delivers each SEI run of a trip as its own folder; each such segment is a row of
+its own (``segment`` = its label), and the trip itself keeps a parent row
+(``segment = ''``) that ends ``segmented`` once every segment is complete. The
+parent row has no directory and no files of its own: it stands only while its
+segments do, and dropping a segment's completion drops it too.
 """
 
 from __future__ import annotations
@@ -37,9 +45,11 @@ import sqlite3
 import threading
 import time
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from queue import Empty, Queue
+
+from utils.path_helpers import TripKey
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +65,12 @@ TRIP_PENDING_RESTORE = "pending_restore"
 # the run; a future run re-checks it, because the dataset may have been
 # switched to request_restore=true server-side in the meantime.
 TRIP_ARCHIVED = "archived"
+# Parent row of a chopped (seiData: with_and_chop) trip whose segments are all
+# complete — or that has no segment at all. Terminal, like complete, but the
+# parent has no directory or files of its own, so it is a status of its own:
+# the start-up checks that drop a `complete` row lacking its directory would
+# otherwise drop it every run.
+TRIP_SEGMENTED = "segmented"
 
 # The only `files` statuses that mean "this file was delivered". A file row is
 # also written when a download FAILS, to record which file failed and why, and
@@ -66,15 +82,16 @@ TRIP_ARCHIVED = "archived"
 FILE_DELIVERED = ("downloaded", "uploaded")
 _DELIVERED_SQL = "(" + ", ".join(f"'{s}'" for s in FILE_DELIVERED) + ")"
 
-# Bumped whenever the table shape changes. A DB written by an older version is
-# reset rather than migrated — see `connect`.
-_SCHEMA_VERSION = 2
+# Bumped whenever the table shape changes. A pre-health-grade DB is reset, a v2
+# one migrated in place (segment = '') — see `connect`.
+_SCHEMA_VERSION = 3
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS trips (
     trip_id      TEXT NOT NULL,
     sub_trip     INTEGER NOT NULL,
     health_grade INTEGER NOT NULL,
+    segment      TEXT NOT NULL DEFAULT '',
     status       TEXT NOT NULL,
     country      TEXT,
     state        TEXT,
@@ -85,12 +102,13 @@ CREATE TABLE IF NOT EXISTS trips (
     retry_count  INTEGER DEFAULT 0,
     manifest_generated_at TEXT,
     updated_at   TEXT NOT NULL,
-    PRIMARY KEY (trip_id, sub_trip, health_grade)
+    PRIMARY KEY (trip_id, sub_trip, health_grade, segment)
 );
 CREATE TABLE IF NOT EXISTS files (
     trip_id     TEXT NOT NULL,
     sub_trip    INTEGER NOT NULL,
     health_grade INTEGER NOT NULL,
+    segment     TEXT NOT NULL DEFAULT '',
     rel_path    TEXT NOT NULL,
     kind        TEXT,
     status      TEXT NOT NULL,
@@ -98,7 +116,7 @@ CREATE TABLE IF NOT EXISTS files (
     error_stage TEXT,
     error_message TEXT,
     updated_at  TEXT NOT NULL,
-    PRIMARY KEY (trip_id, sub_trip, health_grade, rel_path)
+    PRIMARY KEY (trip_id, sub_trip, health_grade, segment, rel_path)
 );
 CREATE INDEX IF NOT EXISTS idx_trips_status ON trips(status);
 CREATE TABLE IF NOT EXISTS meta (
@@ -129,6 +147,9 @@ class StatusEvent:
     # that forgets it write grade-500 rows for a graded trip — the exact bug the
     # three-part key exists to prevent.
     health_grade: int
+    # Keyword-only so it can sit with the key. "" is the whole trip (every trip
+    # outside a with_and_chop dataset); a label is one segment of a chopped trip.
+    segment: str = field(default="", kw_only=True)
     status: str
     rel_path: str | None = None
     kind: str | None = None
@@ -380,6 +401,8 @@ def _prune_legacy_rows_to_what_is_on_disk(legacy: Path, output_dir: Path) -> boo
     except sqlite3.Error:
         return False
     try:
+        # Lossless, so safe on a ledger that may yet be declined below.
+        _migrate_v2_to_v3(conn, legacy)
         delivered = completed_rows_with_files(conn, output_dir)
     except sqlite3.Error:
         conn.close()
@@ -485,10 +508,91 @@ def connect(db_path: Path) -> sqlite3.Connection:
     conn.execute("PRAGMA busy_timeout=5000")
     conn.execute("PRAGMA synchronous=NORMAL")
     _reset_if_legacy_schema(conn, db_path)
+    _migrate_v2_to_v3(conn, db_path)
     conn.executescript(_SCHEMA)
     conn.execute(f"PRAGMA user_version={_SCHEMA_VERSION}")
     conn.commit()
     return conn
+
+
+def _migrate_v2_to_v3(conn: sqlite3.Connection, db_path: Path) -> None:
+    """Add ``segment`` to the trip and file keys of a v2 ledger, keeping every row.
+
+    SQLite cannot add a column to a primary key, so the tables are rebuilt: the
+    v2 ones are renamed aside, the v3 ones created, the rows copied with
+    ``segment = ''`` (every v2 row is a whole trip), and the old tables dropped.
+    Unlike the pre-health-grade reset, nothing is lost: an in-flight download
+    keeps its progress across the upgrade.
+
+    One transaction, statement by statement — ``executescript`` would COMMIT
+    part-way — so a kill leaves either the v2 tables or the v3 ones, never a
+    mix. The status index is dropped first: index names are database-wide and a
+    rename carries the index along to ``trips_v2``, where the ``IF NOT EXISTS``
+    in ``_SCHEMA`` would find it and then lose it with the table.
+
+    Only a v2 ledger (``health_grade`` present, ``segment`` absent) is touched;
+    anything else is left to ``_reset_if_legacy_schema`` / ``_SCHEMA``.
+    Idempotent: ``connect`` runs it on every open.
+    """
+    tables = {
+        row[0]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('trips','files')"
+        ).fetchall()
+    }
+    if "trips" not in tables:
+        return
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(trips)").fetchall()}
+    if "segment" in columns or "health_grade" not in columns:
+        return
+    statements = [s.strip() for s in _SCHEMA.split(";") if s.strip()]
+    conn.commit()  # nothing of ours may be pending in the transaction below
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        # Re-read under the write lock: another process (only possible with
+        # ALLOW_UNLOCKED_RUNS) may have migrated between the check above and here.
+        if "segment" in {row[1] for row in conn.execute("PRAGMA table_info(trips)")}:
+            conn.rollback()
+            return
+        conn.execute("DROP INDEX IF EXISTS idx_trips_status")
+        conn.execute("ALTER TABLE trips RENAME TO trips_v2")
+        if "files" in tables:
+            conn.execute("ALTER TABLE files RENAME TO files_v2")
+        for statement in statements:
+            conn.execute(statement)
+        counts = []
+        for table in ("trips", "files"):
+            if table not in tables:
+                counts.append(0)
+                continue
+            old = {
+                row[1]
+                for row in conn.execute(f"PRAGMA table_info({table}_v2)").fetchall()
+            }
+            new = [
+                row[1]
+                for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+                if row[1] != "segment"
+            ]
+            cols = ", ".join(c for c in new if c in old)
+            conn.execute(
+                f"INSERT INTO {table} ({cols}, segment) SELECT {cols}, '' FROM {table}_v2"
+            )
+            counts.append(
+                conn.execute(f"SELECT COUNT(*) FROM {table}_v2").fetchone()[0]
+            )
+            conn.execute(f"DROP TABLE {table}_v2")
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    logger.info(
+        "Ledger %s upgraded to schema v3 (trip segments); kept %d trip and %d file "
+        "row(s)",
+        db_path,
+        counts[0],
+        counts[1],
+    )
 
 
 def _reset_if_legacy_schema(conn: sqlite3.Connection, db_path: Path) -> None:
@@ -524,7 +628,7 @@ def _reset_if_legacy_schema(conn: sqlite3.Connection, db_path: Path) -> None:
 
 def completed_rows_with_files(
     conn: sqlite3.Connection, output_dir: Path
-) -> dict[tuple[str, int, int], tuple[Path, list[Path]]]:
+) -> dict[TripKey, tuple[Path, list[Path]]]:
     """``{completed key: (its trip directory, the files its row recorded)}``.
 
     A completed row is a claim; the files it recorded are the evidence. Every
@@ -536,15 +640,15 @@ def completed_rows_with_files(
     """
     from utils.path_helpers import build_trip_directory_path  # noqa: PLC0415
 
-    out: dict[tuple[str, int, int], list[Path]] = {}
+    out: dict[TripKey, tuple[Path, list[Path]]] = {}
     rows = conn.execute(
-        "SELECT trip_id, sub_trip, health_grade, country, state FROM trips "
+        "SELECT trip_id, sub_trip, health_grade, segment, country, state FROM trips "
         f"WHERE status = '{TRIP_COMPLETE}'"
     ).fetchall()
-    for trip_id, sub_trip, grade, country, state in rows:
-        key = (trip_id, int(sub_trip), int(grade))
+    for trip_id, sub_trip, grade, segment, country, state in rows:
+        key = TripKey(trip_id, int(sub_trip), int(grade), segment)
         trip_dir = build_trip_directory_path(
-            output_dir, country or "", state or "", trip_id, key[1], key[2]
+            output_dir, country or "", state or "", *key
         )
         out[key] = (
             trip_dir,
@@ -552,7 +656,7 @@ def completed_rows_with_files(
                 trip_dir / row[0]
                 for row in conn.execute(
                     "SELECT rel_path FROM files WHERE trip_id = ? AND sub_trip = ? "
-                    f"AND health_grade = ? AND status IN {_DELIVERED_SQL}",
+                    f"AND health_grade = ? AND segment = ? AND status IN {_DELIVERED_SQL}",
                     key,
                 ).fetchall()
             ],
@@ -560,9 +664,7 @@ def completed_rows_with_files(
     return out
 
 
-def drop_completions(
-    conn: sqlite3.Connection, keys: Iterable[tuple[str, int, int]]
-) -> int:
+def drop_completions(conn: sqlite3.Connection, keys: Iterable[TripKey]) -> int:
     """Forget these completions so the trips are fetched again. Returns how many."""
     keys = list(keys)
     if keys:
@@ -572,15 +674,33 @@ def drop_completions(
         # a dropped completion that can never be re-earned, and a `files` table
         # that grows without bound across runs.
         conn.executemany(
-            "DELETE FROM files WHERE trip_id = ? AND sub_trip = ? AND health_grade = ?",
+            "DELETE FROM files WHERE trip_id = ? AND sub_trip = ? AND health_grade = ? "
+            "AND segment = ?",
             keys,
         )
-        conn.executemany(
-            "DELETE FROM trips WHERE trip_id = ? AND sub_trip = ? AND health_grade = ?",
-            keys,
-        )
+        _delete_trip_rows(conn, keys)
         conn.commit()
     return len(keys)
+
+
+def _delete_trip_rows(conn: sqlite3.Connection, keys: list[TripKey]) -> None:
+    """Delete these trip rows, and the ``segmented`` parent of any segment among them.
+
+    A segmented parent stands only while every one of its segments is complete:
+    it has no directory or files of its own to be checked. So whenever a
+    segment's completion goes, its parent's goes with it, the trip is
+    re-enqueued, and the worker re-delivers just the missing segment.
+    """
+    conn.executemany(
+        "DELETE FROM trips WHERE trip_id = ? AND sub_trip = ? AND health_grade = ? "
+        "AND segment = ?",
+        keys,
+    )
+    conn.executemany(
+        "DELETE FROM trips WHERE trip_id = ? AND sub_trip = ? AND health_grade = ? "
+        f"AND segment = '' AND status = '{TRIP_SEGMENTED}'",
+        [key[:3] for key in keys if key[3]],
+    )
 
 
 # Every scope that has ever run against an output dir leaves its digest here, so
@@ -630,12 +750,22 @@ def other_scopes_touched(db_path: Path, output_dir: Path) -> bool:
     return False
 
 
-def completed_trip_keys(conn: sqlite3.Connection) -> set[tuple[str, int, int]]:
-    """``(trip_id, sub_trip, health_grade)`` keys already complete — NOT re-enqueued."""
+def _keys_with_status(conn: sqlite3.Connection, status: str) -> set[TripKey]:
     rows = conn.execute(
-        f"SELECT trip_id, sub_trip, health_grade FROM trips WHERE status = '{TRIP_COMPLETE}'"
+        "SELECT trip_id, sub_trip, health_grade, segment FROM trips WHERE status = ?",
+        (status,),
     ).fetchall()
-    return {(row[0], int(row[1]), int(row[2])) for row in rows}
+    return {TripKey(row[0], int(row[1]), int(row[2]), row[3]) for row in rows}
+
+
+def completed_trip_keys(conn: sqlite3.Connection) -> set[TripKey]:
+    """Keys already complete — NOT re-enqueued. Includes completed segments."""
+    return _keys_with_status(conn, TRIP_COMPLETE)
+
+
+def segmented_trip_keys(conn: sqlite3.Connection) -> set[TripKey]:
+    """Chopped trips whose every segment is complete — done, like a complete trip."""
+    return _keys_with_status(conn, TRIP_SEGMENTED)
 
 
 @dataclass(frozen=True)
@@ -654,7 +784,7 @@ class LegacyCompletion:
 
 def ledgers_for_output_dir(
     output_dir: Path, state_dir: Path | None = None
-) -> list[tuple[str, dict[tuple[str, int, int], LegacyCompletion], set[tuple[str, int, int]]]]:
+) -> list[tuple[str, dict[TripKey, LegacyCompletion], set[TripKey]]]:
     """``(scope_digest, {completed key: its delivered files}, all keys mentioned)``.
 
     Used once, by the marker import: the scope digest is the ``__<digest>`` part of
@@ -673,9 +803,7 @@ def ledgers_for_output_dir(
     root = state_dir if state_dir is not None else STATE_DIR
     if not root.is_dir():
         return []
-    found: list[
-        tuple[str, dict[tuple[str, int, int], LegacyCompletion], set[tuple[str, int, int]]]
-    ] = []
+    found: list[tuple[str, dict[TripKey, LegacyCompletion], set[TripKey]]] = []
     for db_path in sorted(root.glob("*__*.db")):
         if ledger_output_dir(db_path) != str(output_dir):
             continue
@@ -684,15 +812,21 @@ def ledgers_for_output_dir(
             conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
         except sqlite3.Error:  # pragma: no cover - unreadable file
             continue
-        delivered: dict[tuple[str, int, int], LegacyCompletion] = {}
+        delivered: dict[TripKey, LegacyCompletion] = {}
         try:
-            for trip_id, sub_trip, grade, country, state in conn.execute(
-                "SELECT trip_id, sub_trip, health_grade, country, state FROM trips "
-                f"WHERE status = '{TRIP_COMPLETE}'"
+            # Read-only, so an older ledger is never upgraded here: one written
+            # before segments existed is all whole trips.
+            has_segment = "segment" in {
+                row[1] for row in conn.execute("PRAGMA table_info(trips)").fetchall()
+            }
+            segment_sql = "segment" if has_segment else "'' AS segment"
+            for trip_id, sub_trip, grade, segment, country, state in conn.execute(
+                f"SELECT trip_id, sub_trip, health_grade, {segment_sql}, country, "
+                f"state FROM trips WHERE status = '{TRIP_COMPLETE}'"
             ).fetchall():
-                key = (trip_id, int(sub_trip), int(grade))
+                key = TripKey(trip_id, int(sub_trip), int(grade), segment)
                 trip_dir = build_trip_directory_path(
-                    output_dir, country or "", state or "", trip_id, key[1], key[2]
+                    output_dir, country or "", state or "", *key
                 )
                 delivered[key] = LegacyCompletion(
                     country or "",
@@ -702,8 +836,9 @@ def ledgers_for_output_dir(
                         row[0]
                         for row in conn.execute(
                             "SELECT rel_path FROM files WHERE trip_id = ? AND "
-                            "sub_trip = ? AND health_grade = ?",
-                            key,
+                            "sub_trip = ? AND health_grade = ?"
+                            + (" AND segment = ?" if has_segment else ""),
+                            key if has_segment else key[:3],
                         ).fetchall()
                     ],
                 )
@@ -713,9 +848,9 @@ def ledgers_for_output_dir(
             # still evidence that it touched the trip's directory — enough to
             # make another scope's claim on it unsafe to import.
             mentioned = {
-                (row[0], int(row[1]), int(row[2]))
+                TripKey(row[0], int(row[1]), int(row[2]), row[3])
                 for row in conn.execute(
-                    "SELECT trip_id, sub_trip, health_grade FROM trips"
+                    f"SELECT trip_id, sub_trip, health_grade, {segment_sql} FROM trips"
                 ).fetchall()
             }
         except sqlite3.Error:
@@ -742,8 +877,8 @@ def verification_done(conn: sqlite3.Connection) -> None:
 
 def reconcile_with_markers(
     conn: sqlite3.Connection,
-    marker_keys: set[tuple[str, int, int]],
-    evidence_for: "Callable[[tuple[str, int, int]], tuple[str, str, list[str]]] | None" = None,
+    marker_keys: set[TripKey],
+    evidence_for: "Callable[[TripKey], tuple[str, str, list[str]]] | None" = None,
 ) -> tuple[int, int]:
     """Make the ledger agree with what is actually on disk. Returns (added, dropped).
 
@@ -771,17 +906,17 @@ def reconcile_with_markers(
         }
         conn.executemany(
             """
-            INSERT INTO trips (trip_id, sub_trip, health_grade, status, country, state,
-                               updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(trip_id, sub_trip, health_grade) DO UPDATE SET
+            INSERT INTO trips (trip_id, sub_trip, health_grade, segment, status,
+                               country, state, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(trip_id, sub_trip, health_grade, segment) DO UPDATE SET
                 status=excluded.status, country=excluded.country,
                 state=excluded.state, updated_at=excluded.updated_at
             """,
             [
-                (t, s, g, TRIP_COMPLETE, evidence[(t, s, g)][0] or None,
-                 evidence[(t, s, g)][1] or None, now)
-                for t, s, g in sorted(added)
+                (*key, TRIP_COMPLETE, evidence[key][0] or None,
+                 evidence[key][1] or None, now)
+                for key in sorted(added)
             ],
         )
         # REPLACE the inventory, do not merge into it. An earlier attempt can
@@ -789,19 +924,20 @@ def reconcile_with_markers(
         # attempt never delivered; checked alongside the marker's evidence they
         # would sink an intact trip.
         conn.executemany(
-            "DELETE FROM files WHERE trip_id = ? AND sub_trip = ? AND health_grade = ?",
+            "DELETE FROM files WHERE trip_id = ? AND sub_trip = ? AND health_grade = ? "
+            "AND segment = ?",
             sorted(added),
         )
         conn.executemany(
             """
-            INSERT INTO files (trip_id, sub_trip, health_grade, rel_path, status,
-                               updated_at)
-            VALUES (?, ?, ?, ?, 'downloaded', ?)
+            INSERT INTO files (trip_id, sub_trip, health_grade, segment, rel_path,
+                               status, updated_at)
+            VALUES (?, ?, ?, ?, ?, 'downloaded', ?)
             """,
             [
-                (t, s, g, rel, now)
-                for t, s, g in sorted(added)
-                for rel in evidence[(t, s, g)][2]
+                (*key, rel, now)
+                for key in sorted(added)
+                for rel in evidence[key][2]
             ],
         )
         # Committed together with the rows: the rebuilt completions are not to be
@@ -813,29 +949,23 @@ def reconcile_with_markers(
             (_META_VERIFY_PENDING,),
         )
     if dropped:
-        conn.executemany(
-            "DELETE FROM trips WHERE trip_id = ? AND sub_trip = ? AND health_grade = ?",
-            sorted(dropped),
-        )
+        _delete_trip_rows(conn, sorted(dropped))
     if added or dropped:
         conn.commit()
     return len(added), len(dropped)
 
 
-def pending_restore_trip_keys(conn: sqlite3.Connection) -> set[tuple[str, int, int]]:
+def pending_restore_trip_keys(conn: sqlite3.Connection) -> set[TripKey]:
     """Keys held back by a Deep-Archive restore — excluded from in-run retry passes.
 
     A restore takes hours (~12h standard / ~48h bulk tier), so re-fetching the
     manifest seconds later cannot help. The trips are NOT complete, so a future
     run of the same command re-enqueues and finishes them.
     """
-    rows = conn.execute(
-        f"SELECT trip_id, sub_trip, health_grade FROM trips WHERE status = '{TRIP_PENDING_RESTORE}'"
-    ).fetchall()
-    return {(row[0], int(row[1]), int(row[2])) for row in rows}
+    return _keys_with_status(conn, TRIP_PENDING_RESTORE)
 
 
-def archived_trip_keys(conn: sqlite3.Connection) -> set[tuple[str, int, int]]:
+def archived_trip_keys(conn: sqlite3.Connection) -> set[TripKey]:
     """Keys held back by archived (restore-not-requested) files.
 
     Excluded from IN-RUN retry passes only: the verdict changes when the dataset
@@ -843,10 +973,7 @@ def archived_trip_keys(conn: sqlite3.Connection) -> set[tuple[str, int, int]]:
     The trips are NOT complete, so a future run of the same command re-enqueues
     them and re-fetches their manifests.
     """
-    rows = conn.execute(
-        f"SELECT trip_id, sub_trip, health_grade FROM trips WHERE status = '{TRIP_ARCHIVED}'"
-    ).fetchall()
-    return {(row[0], int(row[1]), int(row[2])) for row in rows}
+    return _keys_with_status(conn, TRIP_ARCHIVED)
 
 
 # Written by pending_restore_message, parsed back by pending_restore_stats — keep in sync.
@@ -871,17 +998,17 @@ def archived_message(files: int) -> str:
 
 
 def archived_stats(
-    conn: sqlite3.Connection, in_scope: set[tuple[str, int, int]]
+    conn: sqlite3.Connection, in_scope: set[TripKey]
 ) -> tuple[int, int]:
     """``(trips, files)`` across in-scope archived rows."""
     rows = conn.execute(
-        "SELECT trip_id, sub_trip, health_grade, error_message FROM trips "
+        "SELECT trip_id, sub_trip, health_grade, segment, error_message FROM trips "
         f"WHERE status = '{TRIP_ARCHIVED}'"
     ).fetchall()
     trips = 0
     files = 0
-    for trip_id, sub_trip, health_grade, message in rows:
-        if (trip_id, int(sub_trip), int(health_grade)) not in in_scope:
+    for trip_id, sub_trip, health_grade, segment, message in rows:
+        if TripKey(trip_id, int(sub_trip), int(health_grade), segment) not in in_scope:
             continue
         trips += 1
         files_match = _RESTORE_FILES_RE.match(message or "")
@@ -890,18 +1017,18 @@ def archived_stats(
 
 
 def pending_restore_stats(
-    conn: sqlite3.Connection, in_scope: set[tuple[str, int, int]]
+    conn: sqlite3.Connection, in_scope: set[TripKey]
 ) -> tuple[int, int, int | None]:
     """``(trips, files, max_available_at_ms)`` across in-scope pending_restore rows."""
     rows = conn.execute(
-        "SELECT trip_id, sub_trip, health_grade, error_message FROM trips "
+        "SELECT trip_id, sub_trip, health_grade, segment, error_message FROM trips "
         f"WHERE status = '{TRIP_PENDING_RESTORE}'"
     ).fetchall()
     trips = 0
     files = 0
     max_eta: int | None = None
-    for trip_id, sub_trip, health_grade, message in rows:
-        if (trip_id, int(sub_trip), int(health_grade)) not in in_scope:
+    for trip_id, sub_trip, health_grade, segment, message in rows:
+        if TripKey(trip_id, int(sub_trip), int(health_grade), segment) not in in_scope:
             continue
         trips += 1
         files_match = _RESTORE_FILES_RE.match(message or "")
@@ -971,12 +1098,12 @@ class LedgerWriter(threading.Thread):
         if event.scope == "trip":
             self._conn.execute(
                 """
-                INSERT INTO trips (trip_id, sub_trip, health_grade, status, country,
-                                   state, timezone, file_total, error_stage,
+                INSERT INTO trips (trip_id, sub_trip, health_grade, segment, status,
+                                   country, state, timezone, file_total, error_stage,
                                    error_message, manifest_generated_at, updated_at,
                                    retry_count)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
-                ON CONFLICT(trip_id, sub_trip, health_grade) DO UPDATE SET
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+                ON CONFLICT(trip_id, sub_trip, health_grade, segment) DO UPDATE SET
                     status=excluded.status,
                     country=COALESCE(excluded.country, trips.country),
                     state=COALESCE(excluded.state, trips.state),
@@ -994,6 +1121,7 @@ class LedgerWriter(threading.Thread):
                     event.trip_id,
                     event.sub_trip,
                     event.health_grade,
+                    event.segment,
                     event.status,
                     event.country,
                     event.state,
@@ -1010,11 +1138,12 @@ class LedgerWriter(threading.Thread):
         else:
             self._conn.execute(
                 """
-                INSERT INTO files (trip_id, sub_trip, health_grade, rel_path, kind,
-                                   status, size_bytes, error_stage, error_message,
+                INSERT INTO files (trip_id, sub_trip, health_grade, segment, rel_path,
+                                   kind, status, size_bytes, error_stage, error_message,
                                    updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(trip_id, sub_trip, health_grade, rel_path) DO UPDATE SET
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(trip_id, sub_trip, health_grade, segment, rel_path)
+                DO UPDATE SET
                     kind=COALESCE(excluded.kind, files.kind),
                     status=excluded.status,
                     size_bytes=COALESCE(excluded.size_bytes, files.size_bytes),
@@ -1026,6 +1155,7 @@ class LedgerWriter(threading.Thread):
                     event.trip_id,
                     event.sub_trip,
                     event.health_grade,
+                    event.segment,
                     event.rel_path,
                     event.kind,
                     event.status,
@@ -1047,9 +1177,12 @@ class LedgerWriter(threading.Thread):
     def _append_failure(self, event: StatusEvent, now: str) -> None:
         if self._failure_log is None:
             return
+        # A segment goes last, and only when there is one: a whole trip's line keeps
+        # the exact columns customers already cut this log by.
+        segment = f"\t{event.segment}" if event.segment else ""
         line = (
             f"{now}\t{event.trip_id}\t{event.sub_trip}\t{event.health_grade}\t"
-            f"{event.error_stage or ''}\t{event.error_message or ''}\n"
+            f"{event.error_stage or ''}\t{event.error_message or ''}{segment}\n"
         )
         with self._failure_log.open("a", encoding="utf-8") as handle:
             handle.write(line)
@@ -1065,22 +1198,26 @@ class LedgerWriter(threading.Thread):
 
     def _render(self, *, force: bool = False) -> None:
         self._last_render = time.monotonic()
+        # Whole trips only: a chopped trip's segment rows are its parts, and
+        # counting them would push `done` past the trip total.
         trip_counts = dict(
             self._conn.execute(
-                "SELECT status, COUNT(*) FROM trips GROUP BY status"
+                "SELECT status, COUNT(*) FROM trips WHERE segment = '' GROUP BY status"
             ).fetchall()
         )
         # `trips` only: one row per trip, and status is indexed. The `files` table
         # is one row per file (millions on a real dataset) and is NOT queried here
         # — those figures come from the events this writer has applied.
         file_counts = self._file_events
-        done = trip_counts.get(TRIP_COMPLETE, 0)
+        done = trip_counts.get(TRIP_COMPLETE, 0) + trip_counts.get(TRIP_SEGMENTED, 0)
         logger.info(
-            "PROGRESS trips %d/%d (complete=%d partial=%d failed=%d pending_restore=%d "
-            "archived=%d in_progress=%d) | files this pass dl=%d up=%d failed=%d",
+            "PROGRESS trips %d/%d (complete=%d segmented=%d partial=%d failed=%d "
+            "pending_restore=%d archived=%d in_progress=%d) | files this pass dl=%d "
+            "up=%d failed=%d",
             done,
             self._total,
-            done,
+            trip_counts.get(TRIP_COMPLETE, 0),
+            trip_counts.get(TRIP_SEGMENTED, 0),
             trip_counts.get(TRIP_PARTIAL, 0),
             trip_counts.get(TRIP_FAILED, 0),
             trip_counts.get(TRIP_PENDING_RESTORE, 0),
