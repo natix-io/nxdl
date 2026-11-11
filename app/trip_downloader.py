@@ -2,11 +2,14 @@ import errno
 import logging
 import os
 import shutil
+import socket
 import tempfile
+import uuid
 from collections.abc import Callable, Collection
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
+from urllib.parse import urlencode
 import httpx
 
 from schemas import (
@@ -19,18 +22,13 @@ from utils.path_helpers import (
     SEGMENT_LABEL_RE,
     TripKey,
     build_cache_trip_path,
-    build_camera_file_path,
-    build_feature_file_path,
     build_features_directory_path,
-    build_camera_video_path,
-    build_fused_sei_path,
-    build_minute_directory_path,
     build_trip_directory_path,
-    build_camera_directory_path,
     get_r2_url_from_presigned_url,
-    is_camera_allowed,
 )
 from app.ds_formatter import format_ds
+# Kept under its old private name: tests/test_process_trip.py uses it.
+from nxdl_core.expected_files import expected_s3_keys as _expected_s3_keys
 from app.validation import validate_trip
 from utils import markers
 from utils.download import download_file_with_retry, sweep_partial_files
@@ -50,6 +48,7 @@ from utils.ledger import (
 )
 from utils.s3_uploader import upload_trip_atomic
 from utils.settings import settings
+from utils.trip_assets import PendingRestore, enumerate_trip_assets
 from utils.trip_selection import segment_units, select_minutes
 
 logger = logging.getLogger(__name__)
@@ -99,11 +98,26 @@ def _revoke_claims(output_dir: Path, key: TripKey) -> None:
 
 AUTH_HEADER_NAME = "ApiKey"
 
+# One id per run. Kept in the environment so spawned/forked workers report the same run.
+RUN_ID = os.environ.setdefault("NXDL_RUN_ID", uuid.uuid4().hex)
+
+
+def api_headers(api_key: str) -> dict[str, str]:
+    """Headers for NATIX API calls only. Never sent to presigned download URLs."""
+    return {
+        AUTH_HEADER_NAME: api_key,
+        "User-Agent": f"nxdl/{os.environ.get('NXDL_VERSION', 'dev')}",
+        "X-Nxdl-Run-Id": RUN_ID,
+        "X-Nxdl-Dry-Run": "true" if settings.dry_mode else "false",
+        # HTTP header values must be ASCII; a hostname like "Jürgen-PC" would abort the run.
+        "X-Nxdl-Host": socket.gethostname().encode("ascii", "replace").decode()[:128],
+    }
+
 
 def _api_get(url: str, api_key: str) -> httpx.Response:
     return get_with_retry(
         url,
-        headers={AUTH_HEADER_NAME: api_key},
+        headers=api_headers(api_key),
         timeout=settings.api_timeout,
         max_retries=settings.api_max_retries,
         base_delay_seconds=settings.api_retry_base_delay,
@@ -130,15 +144,24 @@ def get_trip_manifest(
     trip_id: str,
     sub_trip: int,
     health_grade: int = 500,
+    *,
+    params: dict[str, str] | None = None,
+    model: type[TripManifest] = TripManifest,
 ) -> TripManifest:
-    """Fetch and parse the trip manifest response."""
+    """Fetch and parse the trip manifest response.
+
+    ``params`` are extra query parameters and ``model`` the class the response is
+    parsed into; the defaults reproduce the plain request.
+    """
     url = (
         f"{settings.base_url}/v1/trip/manifest"
         f"?dataset_id={dataset_id}&trip_id={trip_id}&sub_trip={sub_trip}"
         f"&health_grade={health_grade}"
     )
+    if params:
+        url += f"&{urlencode(params)}"
     response = _api_get(url, api_key)
-    return TripManifest.model_validate(response.json())
+    return model.model_validate(response.json())
 
 
 # Conservative client default, below the service's 100-key maximum. Trip count
@@ -153,6 +176,9 @@ def get_trip_manifests(
     api_key: str,
     dataset_id: str,
     keys: list[TripKey],
+    *,
+    params: dict[str, str] | None = None,
+    model: type[TripManifest] = TripManifest,
 ) -> tuple[dict[TripKey, TripManifest], dict[TripKey, str]]:
     """Manifests for many trips, in as few requests as the service allows.
 
@@ -168,11 +194,19 @@ def get_trip_manifests(
     state, the QA coverage check — spends its time waiting rather than working.
     Where the service offers the batch route this asks for 25 at a time; where it
     does not, it falls back to the per-trip route and the caller cannot tell.
+
+    ``params`` / ``model`` go to the batch POST and to the per-trip fallback alike.
     """
     global _batch_route_available
     manifests: dict[TripKey, TripManifest] = {}
     errors: dict[TripKey, str] = {}
     remaining = list(dict.fromkeys(keys))
+    # Only forwarded when set, so the default call is the one it always was.
+    extra: dict[str, Any] = {}
+    if params:
+        extra["params"] = params
+    if model is not TripManifest:
+        extra["model"] = model
 
     # THIS call's outcome, never the shared global. The global is only a hint
     # that saves a doomed request; reading it back to decide whether this call
@@ -184,7 +218,9 @@ def get_trip_manifests(
         for start in range(0, len(remaining), MANIFEST_BATCH_SIZE):
             chunk = remaining[start : start + MANIFEST_BATCH_SIZE]
             try:
-                got, failed = _post_trip_manifests(api_key, dataset_id, chunk)
+                got, failed = _post_trip_manifests(
+                    api_key, dataset_id, chunk, **extra
+                )
             except _BatchRouteUnavailable:
                 _batch_route_available = False
                 batched_everything = False
@@ -215,7 +251,7 @@ def get_trip_manifests(
             continue
         try:
             manifests[key] = get_trip_manifest(
-                api_key, dataset_id, key.trip_id, key.sub_trip, key.health_grade
+                api_key, dataset_id, key.trip_id, key.sub_trip, key.health_grade, **extra
             )
         except Exception as exc:
             errors[key] = f"{type(exc).__name__}: {exc}"
@@ -227,7 +263,12 @@ class _BatchRouteUnavailable(Exception):
 
 
 def _post_trip_manifests(
-    api_key: str, dataset_id: str, keys: list[TripKey]
+    api_key: str,
+    dataset_id: str,
+    keys: list[TripKey],
+    *,
+    params: dict[str, str] | None = None,
+    model: type[TripManifest] = TripManifest,
 ) -> tuple[dict[TripKey, TripManifest], dict[TripKey, str]]:
     payload = {
         "dataset_id": dataset_id,
@@ -236,10 +277,13 @@ def _post_trip_manifests(
             for k in keys
         ],
     }
+    url = f"{settings.base_url}/v1/trip/manifests"
+    if params:
+        url += f"?{urlencode(params)}"
     response = post_with_retry(
-        f"{settings.base_url}/v1/trip/manifests",
+        url,
         json=payload,
-        headers={AUTH_HEADER_NAME: api_key},
+        headers=api_headers(api_key),
         timeout=settings.api_timeout,
         max_retries=settings.api_max_retries,
         base_delay_seconds=settings.api_retry_base_delay,
@@ -252,7 +296,7 @@ def _post_trip_manifests(
 
     manifests: dict[TripKey, TripManifest] = {}
     for item in body.get("manifests", []):
-        manifest = TripManifest.model_validate(item)
+        manifest = model.model_validate(item)
         manifests[TripKey(manifest.trip_id, manifest.sub_trip, manifest.health_grade)] = (
             manifest
         )
@@ -283,10 +327,6 @@ def _get_trip_location(manifest: TripManifest) -> tuple[str | None, str | None]:
     return manifest.country, manifest.state
 
 
-def _get_trip_timezone(manifest: TripManifest) -> str | None:
-    return manifest.timezone
-
-
 class _DownloadTask:
     """One file to fetch: either a streamed download or a dry-mode link file."""
 
@@ -301,28 +341,7 @@ class _DownloadTask:
         self.is_link = is_link
 
 
-@dataclass
-class _PendingRestore:
-    """Files the manifest withholds because they sit in S3 Deep Archive.
-
-    Two categories: ``files`` are restoring (link comes after the restore
-    completes) and ``archived`` files will never come — the dataset was created
-    without ``settings.request_restore``.
-    """
-
-    files: int = 0
-    max_available_at: int | None = None  # epoch ms; None when no ETA is known
-    archived: int = 0
-
-    def add(self, available_at: int | None) -> None:
-        self.files += 1
-        if available_at is not None and (
-            self.max_available_at is None or available_at > self.max_available_at
-        ):
-            self.max_available_at = available_at
-
-    def add_archived(self) -> None:
-        self.archived += 1
+_PendingRestore = PendingRestore
 
 
 def _iter_trip_tasks(
@@ -334,91 +353,17 @@ def _iter_trip_tasks(
     and are tallied in the returned ``_PendingRestore`` instead, so the caller can
     hold the trip until a later run re-fetches the manifest and backfills them.
     """
-    timezone = _get_trip_timezone(manifest)
+    assets, pending = enumerate_trip_assets(manifest, output)
     tasks: list[_DownloadTask] = []
-    pending = _PendingRestore()
-
-    for minute in manifest.minutes:
-        minute_dir = build_minute_directory_path(
-            trip_dir, minute.minute_epoch, timezone
-        )
-        if output.footage.fused_sei is not None:
-            if minute.fused_sei_status == "archived":
-                pending.add_archived()
-            elif minute.fused_sei_status == "restoring":
-                pending.add(minute.fused_sei_available_at)
-            elif getattr(minute, "fused_sei", None) is not None:
-                fused_sei_path = build_fused_sei_path(
-                    minute_dir, minute.minute_epoch, timezone
-                )
-                tasks.append(
-                    _DownloadTask(
-                        "fused_sei", minute.fused_sei.presigned_url, fused_sei_path
-                    )
-                )
-        for camera in minute.cameras:
-            if not is_camera_allowed(camera.camera_type):
-                continue
-            camera_dir = build_camera_directory_path(
-                minute_dir=minute_dir, camera_type=camera.camera_type
+    for asset in assets:
+        dest = trip_dir / asset.rel_path
+        if asset.kind == "video" and settings.dry_mode:
+            link_dest = dest.parent / (dest.name + ".link")
+            tasks.append(
+                _DownloadTask("link", asset.link.presigned_url, link_dest, is_link=True)
             )
-            camera_path = build_camera_video_path(
-                camera_dir, camera.camera_type, minute.minute_epoch, timezone
-            )
-            if camera.video_status == "archived":
-                pending.add_archived()
-            elif camera.video_status == "restoring" or camera.camera is None:
-                pending.add(camera.video_available_at)
-            elif settings.dry_mode:
-                link_path = camera_path.parent / (camera_path.name + ".link")
-                tasks.append(
-                    _DownloadTask(
-                        "link", camera.camera.presigned_url, link_path, is_link=True
-                    )
-                )
-            else:
-                tasks.append(
-                    _DownloadTask("video", camera.camera.presigned_url, camera_path)
-                )
-
-            if (
-                manifest.health_grade != 0
-                and camera.telemetry is not None
-                and output.footage.needs_telemetry()
-            ):
-                telemetry_path = build_camera_file_path(
-                    camera_dir, camera.telemetry.presigned_url
-                )
-                tasks.append(
-                    _DownloadTask(
-                        "telemetry", camera.telemetry.presigned_url, telemetry_path
-                    )
-                )
-
-            if output.footage.sei is not None:
-                if camera.sei_status == "archived":
-                    pending.add_archived()
-                elif camera.sei_status == "restoring":
-                    pending.add(camera.sei_available_at)
-                elif camera.sei is not None:
-                    sei_path = camera_path.with_suffix(".sei")
-                    sei_path = sei_path.with_name(sei_path.name + ".csv")
-                    tasks.append(
-                        _DownloadTask("sei", camera.sei.presigned_url, sei_path)
-                    )
-
-    for feature_name in (
-        "fixed_metadata",
-        "base_insights",
-        "safety_critical",
-        "ego_actions",
-    ):
-        feature = getattr(manifest, feature_name, None)
-        if feature is None:
-            continue
-        feature_path = build_feature_file_path(trip_dir, feature_name)
-        tasks.append(_DownloadTask("feature", feature.presigned_url, feature_path))
-
+        else:
+            tasks.append(_DownloadTask(asset.kind, asset.link.presigned_url, dest))
     return tasks, pending
 
 
@@ -673,13 +618,6 @@ def _apply_minute_selection(
     return trimmed
 
 
-def _expected_s3_keys(
-    prefix: str, final_rel: str, expected_rel_paths: list[Path]
-) -> list[str]:
-    base = f"{prefix}/{final_rel}" if prefix else final_rel
-    return [f"{base}/{rel.as_posix()}" for rel in expected_rel_paths]
-
-
 def recover_interrupted_publishes(output_dir: Path) -> int:
     """Finish or roll back publishes a previous run was killed in the middle of.
 
@@ -894,6 +832,9 @@ def process_trip(
     health_grade: int = 500,
     minutes: frozenset[str] | None = None,
     completed_segments: Collection[TripKey] = frozenset(),
+    deliver_unit: Callable[..., tuple[str, _PendingRestore]] | None = None,
+    manifest_params: dict[str, str] | None = None,
+    manifest_model: type[TripManifest] = TripManifest,
 ) -> None:
     """Download, format, move and (optionally) upload one trip, tracking status.
 
@@ -909,7 +850,14 @@ def process_trip(
     is delivered as one folder per segment — see :func:`_deliver_segments`.
     ``completed_segments`` are the segment keys the ledger already holds complete;
     they are not delivered again.
+
+    Extension points, defaults = the download path: ``deliver_unit`` delivers each
+    unit (signature and return of :func:`_deliver_unit`, which is the default), and
+    ``manifest_params`` / ``manifest_model`` go to every manifest fetch, the
+    refresh included (see :func:`get_trip_manifest`).
     """
+    if deliver_unit is None:
+        deliver_unit = _deliver_unit
     trip_key = TripKey(trip_id, sub_trip, health_grade)
     # A trip that is being worked on is certified by nobody, this run included:
     # everything below can replace or (on S3) roll back and delete its data.
@@ -929,7 +877,13 @@ def process_trip(
 
     try:
         trip_manifest = get_trip_manifest(
-            api_key, dataset_id, trip_id, sub_trip, health_grade
+            api_key,
+            dataset_id,
+            trip_id,
+            sub_trip,
+            health_grade,
+            params=manifest_params,
+            model=manifest_model,
         )
     except Exception as exc:
         logger.exception(
@@ -966,14 +920,22 @@ def process_trip(
         # Retry with a fresh manifest in case presigned URLs expired; the minute
         # selection is re-applied so the trim holds across the refresh.
         return _apply_minute_selection(
-            get_trip_manifest(api_key, dataset_id, trip_id, sub_trip, health_grade),
+            get_trip_manifest(
+                api_key,
+                dataset_id,
+                trip_id,
+                sub_trip,
+                health_grade,
+                params=manifest_params,
+                model=manifest_model,
+            ),
             minutes,
             trip_id,
             sub_trip,
         )
 
     if trip_manifest.segments is None:
-        _deliver_unit(
+        deliver_unit(
             trip_key,
             trip_manifest,
             output_dir,
@@ -999,6 +961,7 @@ def process_trip(
         present_keys=present_keys,
         s3_target=s3_target,
         trip_minute_total=trip_minute_total,
+        deliver_unit=deliver_unit,
     )
 
 
@@ -1019,6 +982,7 @@ def _deliver_segments(
     present_keys: set[str] | None,
     s3_target: tuple[str, str] | None,
     trip_minute_total: int | None = None,
+    deliver_unit: Callable[..., tuple[str, _PendingRestore]] | None = None,
 ) -> None:
     """Deliver a chopped trip: each segment as its own trip folder, then the parent row.
 
@@ -1031,7 +995,10 @@ def _deliver_segments(
 
     The TRIPS_FILE minute selection was already applied to ``manifest``; each
     segment keeps the selected minutes it contains, and keeps its server label.
+    ``deliver_unit`` delivers each segment (default :func:`_deliver_unit`).
     """
+    if deliver_unit is None:
+        deliver_unit = _deliver_unit
     trip_id, sub_trip, health_grade, _ = parent
     name = parent.dir_name
     labels = [segment.label for segment in manifest.segments or []]
@@ -1127,7 +1094,7 @@ def _deliver_segments(
             )
             return None
 
-        outcomes[key.segment] = _deliver_unit(
+        outcomes[key.segment] = deliver_unit(
             key,
             unit,
             output_dir,

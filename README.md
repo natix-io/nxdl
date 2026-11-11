@@ -41,7 +41,7 @@ For larger datasets, optionally raise the number of trips downloaded concurrentl
 ./run.sh --api-key <YOUR_API_KEY> --dataset-id <YOUR_DATASET_ID> --output-dir /path/to/dataset --max-parallel-trips 4
 ```
 
-To do a dry run (fetch manifests without downloading any files):
+To do a dry run (videos are not downloaded; SEI, telemetry and metadata files still are, about 1-2% of a full download):
 
 ```bash
 ./run.sh --api-key <YOUR_API_KEY> --dataset-id <YOUR_DATASET_ID> --output-dir /path/to/dataset --dry-run
@@ -130,6 +130,12 @@ Likewise, if you downloaded with `--trips-file`, pass the same file here:
 
 ```bash
 ./validate.sh --output-dir /path/to/dataset --trips-file ./trips.json
+```
+
+To also check that every trip, minute and file of the dataset is present (compared against the dataset manifest), pass your API key and dataset id:
+
+```bash
+./validate.sh --output-dir /path/to/dataset --api-key <YOUR_API_KEY> --dataset-id <YOUR_DATASET_ID>
 ```
 
 The validator scans the local dataset folder and prints:

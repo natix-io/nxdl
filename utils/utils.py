@@ -1,12 +1,11 @@
-def safe_float(value, default=0.0):
-    try:
-        return float(value) if value else default
-    except ValueError:
-        return default
+"""Moved to ``nxdl_core.utils``; this path stays for the shipped client's imports."""
 
-def safe_int(value, default=None):
-    """Safely convert a value to int, returning default on failure."""
-    try:
-        return int(value)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
-        return default
+from nxdl_core.utils import (
+    safe_float,
+    safe_int,
+)
+
+__all__ = [
+    "safe_float",
+    "safe_int",
+]

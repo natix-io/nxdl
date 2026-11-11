@@ -41,7 +41,7 @@ Optional:
                              optionally only some minutes (see README)
   --create-manifest          After the download, write safety_critical_events_manifest.json
                              (events per downloaded minute) into the dataset root
-  --dry-run                  Skip actual downloads; only fetch manifests (default: false)
+  --dry-run                  Skip video downloads; SEI, telemetry and metadata files are still downloaded (default: false)
   -h, --help                 Show this help and exit
 
 Other settings (BASE_URL, timeouts, CAMERA_SELECTION, etc.) are read from
@@ -125,7 +125,10 @@ echo "Starting dataset download..."
 echo "Dataset ID: ${DATASET_ID}"
 echo "Output will be written to ${RESOLVED_OUTPUT_DIR}"
 if [[ "${DRY_MODE:-}" == "true" ]]; then
-    echo "Dry run: no files will be downloaded."
+    echo "Dry run: videos are not downloaded. SEI, telemetry and metadata files still are (about 1-2% of a full download)."
 fi
+
+# Reported to the API as User-Agent nxdl/<commit>; "unknown" outside a git checkout.
+export NXDL_VERSION="$(git -C "${SCRIPT_DIR}" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 
 APP_ENV=production "${VENV_PYTHON}" -m app.main

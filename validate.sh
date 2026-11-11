@@ -37,6 +37,8 @@ Optional:
                             value that was used for ./run.sh
   --trips-file <path>       The same JSON trips file given to ./run.sh, so only
                             the selected trips/minutes are expected
+  --api-key <key>           Your API key and dataset id: needed for the manifest
+  --dataset-id <id>         coverage check, including --manifests api
   -h, --help            Show this help and exit
 
 Any other arguments are passed through to the validator, e.g.:
@@ -65,6 +67,27 @@ while [[ $# -gt 0 ]]; do
         --trips-file=*)
             export TRIPS_FILE="${1#*=}"
             shift
+            ;;
+        --api-key=*)
+            export API_KEY="${1#*=}"
+            shift
+            ;;
+        --dataset-id=*)
+            export DATASET_ID="${1#*=}"
+            shift
+            ;;
+        --api-key|--dataset-id)
+            if [[ $# -lt 2 ]]; then
+                echo "Error: $1 requires a value." >&2
+                usage >&2
+                exit 1
+            fi
+            if [[ "$1" == "--api-key" ]]; then
+                export API_KEY="$2"
+            else
+                export DATASET_ID="$2"
+            fi
+            shift 2
             ;;
         --trips-file)
             if [[ $# -lt 2 ]]; then

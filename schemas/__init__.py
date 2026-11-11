@@ -1,4 +1,4 @@
-from .dataset_request import (
+from nxdl_core.schemas.dataset_request import (
     DatasetFilters,
     DatasetOutput,
     DatasetRequest,
@@ -10,13 +10,13 @@ from .dataset_request import (
 )
 from .dataset_request_response import DatasetRequestResponse
 from .ds_manifest import DSManifest
-from .frame_data import FrameData
-from .trip_manifest import (
+from nxdl_core.schemas.frame_data import FrameData
+from nxdl_core.schemas.trip_manifest import (
     MinuteManifest,
     TripManifest,
     TripSegment,
 )
-from .trip_metadata import TripMetadata
+from nxdl_core.schemas.trip_metadata import TripMetadata
 
 __all__ = [
     "DatasetFilters",

@@ -8,6 +8,7 @@ import os
 import sys
 import tempfile
 import time
+from collections.abc import Callable
 from datetime import UTC, datetime
 from multiprocessing import Process, Queue
 from pathlib import Path
@@ -17,13 +18,14 @@ from schemas import DatasetOutput
 from schemas.dataset_request import DatasetRequest, SEIDataOptions
 from app.event_manifest import write_event_manifest
 from app.trip_downloader import (
+    RUN_ID,
     get_dataset_request,
     get_ds_manifest,
     process_trip,
     recover_interrupted_publishes,
 )
 from utils import ledger, markers
-from utils.ledger import LedgerWriter, Reporter, connect
+from utils.ledger import LedgerWriter, Reporter, StatsTotals, connect
 from utils.path_helpers import (
     FEATURES_DIRNAME,
     TripKey,
@@ -319,6 +321,58 @@ def _filter_requested_trips(
     """
     requested_set = set(requested)
     return [trip for trip in all_trips if trip_matches(requested_set, *trip)]
+
+
+def _apply_trips_file(
+    all_trips: list[TripKey], dataset_id: str
+) -> tuple[list[TripKey], dict[TripKey, frozenset[str]]]:
+    """Narrow ``all_trips`` to the TRIPS_FILE selection, when one is set.
+
+    Returns the trips to process and the per-trip minute selection. Exits 1 on a
+    missing or invalid file. No trips back means none of the requested ones is in
+    the dataset (already logged): there is nothing to do.
+    """
+    minute_selection: dict[TripKey, frozenset[str]] = {}
+    if settings.trips_file.strip():
+        trips_path = Path(settings.trips_file).expanduser()
+        try:
+            selection = load_trips_selection(trips_path)
+        except FileNotFoundError:
+            logger.error("TRIPS_FILE not found: %s", trips_path)
+            sys.exit(1)
+        except ValueError as exc:
+            logger.error("TRIPS_FILE is invalid: %s", exc)
+            sys.exit(1)
+        requested: list[RequestedTripKey] = list(selection.keys())
+        minute_selection = {
+            key: minutes for key, minutes in selection.items() if minutes is not None
+        }
+        dataset_trip_count = len(all_trips)
+        missing = _unmatched_requested_trips(all_trips, requested)
+        if missing:
+            logger.warning(
+                "%d requested trip(s) are not in dataset %s and will be skipped: %s",
+                len(missing),
+                dataset_id,
+                ", ".join(format_trip_key(trip) for trip in missing),
+            )
+        all_trips = _filter_requested_trips(all_trips, requested)
+        if not all_trips:
+            logger.error(
+                "None of the %d requested trip(s) are in dataset %s; nothing to do.",
+                len(requested),
+                dataset_id,
+            )
+            return all_trips, minute_selection
+        logger.info(
+            "Trip filter active (%s): processing %d of %d dataset trip(s), "
+            "%d with a minute selection",
+            trips_path,
+            len(all_trips),
+            dataset_trip_count,
+            sum(1 for trip in all_trips if trip in minute_selection),
+        )
+    return all_trips, minute_selection
 
 
 def _filter_pending_trips(
@@ -848,6 +902,7 @@ def _trip_worker(
     locking_required: bool,
     minute_selection: dict[TripKey, frozenset[str]] | None = None,
     completed_segments: frozenset[TripKey] = frozenset(),
+    trip_fn: Callable[..., None] | None = None,
 ) -> None:
     # Before any work: hold the shared worker lock, so a run that starts after
     # this process's parent dies cannot run recovery over files still being
@@ -870,6 +925,7 @@ def _trip_worker(
             parent_pid,
             minute_selection,
             completed_segments,
+            trip_fn,
         )
     finally:
         # Every way out of the loop passes here, and the sentinel is one of them:
@@ -898,7 +954,12 @@ def _worker_loop(
     parent_pid: int,
     minute_selection: dict[TripKey, frozenset[str]] | None = None,
     completed_segments: frozenset[TripKey] = frozenset(),
+    trip_fn: Callable[..., None] | None = None,
 ) -> None:
+    """Run ``trip_fn`` (``process_trip``'s signature; default ``process_trip``)
+    over the queued trips until a sentinel arrives or the parent is gone."""
+    if trip_fn is None:
+        trip_fn = process_trip
     while True:
         # The lock alone leaves a window: between being started and taking it,
         # this process is invisible to a replacement run's probe, so one can
@@ -929,7 +990,7 @@ def _worker_loop(
         if task is None:
             break
         trip_id, sub_trip, health_grade, _segment = task
-        process_trip(
+        trip_fn(
             api_key,
             dataset_id,
             trip_id,
@@ -994,8 +1055,15 @@ def _run_pass(
     db_path: Path,
     failure_log: Path,
     locking_required: bool,
+    trip_fn: Callable[..., None] | None = None,
+    stats_totals: StatsTotals | None = None,
 ) -> None:
-    """Fork workers over ``trips``, running a single ledger writer in the parent."""
+    """Fork workers over ``trips``, running a single ledger writer in the parent.
+
+    ``trip_fn`` replaces ``process_trip`` in the workers (same signature; under
+    spawn/forkserver it is pickled by reference, so it must be module-level).
+    ``stats_totals`` collects the ``stats`` of this pass's trip events.
+    """
     task_queue: Queue = Queue(maxsize=TASK_QUEUE_MAXSIZE)
     status_queue: Queue = Queue()
 
@@ -1017,6 +1085,7 @@ def _run_pass(
                 locking_required,
                 minute_selection,
                 completed_segments,
+                trip_fn,
             ),
         )
         for _ in range(worker_count)
@@ -1028,7 +1097,9 @@ def _run_pass(
         worker.start()
 
     conn = connect(db_path)
-    writer = LedgerWriter(conn, status_queue, total_trips=total_trips)
+    writer = LedgerWriter(
+        conn, status_queue, total_trips=total_trips, stats_totals=stats_totals
+    )
     writer.attach_failure_log(failure_log)
     writer.start()
 
@@ -1043,6 +1114,110 @@ def _run_pass(
     conn.close()
 
 
+def _run_passes(
+    pending: list[TripKey],
+    all_trips: list[TripKey],
+    done: set[TripKey],
+    completed_segments: frozenset[TripKey],
+    *,
+    db_path: Path,
+    failure_log: Path,
+    **run_pass_args,
+) -> set[TripKey]:
+    """The main pass over ``pending``, then retry passes while trips are retryable.
+
+    ``run_pass_args`` go to every :func:`_run_pass`. Returns the trips the ledger
+    holds done afterwards (``done`` itself when nothing was pending).
+    """
+    pass_num = 0
+    while pending:
+        label = "main pass" if pass_num == 0 else f"retry pass {pass_num}"
+        logger.info("Starting %s over %d trip(s)", label, len(pending))
+        _run_pass(
+            pending,
+            completed_segments=completed_segments,
+            db_path=db_path,
+            failure_log=failure_log,
+            **run_pass_args,
+        )
+
+        conn = connect(db_path)
+        complete_keys = ledger.completed_trip_keys(conn)
+        done = complete_keys | ledger.segmented_trip_keys(conn)
+        completed_segments = frozenset(key for key in complete_keys if key.segment)
+        # Both hold-states are excluded from IN-RUN retries only: a restore takes
+        # hours, and an archived verdict only changes when the dataset is edited
+        # server-side — re-fetching seconds later helps neither. A future run of
+        # the same command re-enqueues both.
+        waiting = ledger.pending_restore_trip_keys(conn) | ledger.archived_trip_keys(conn)
+        conn.close()
+        pending = _filter_pending_trips(all_trips, done)
+        retryable = _filter_retryable_trips(pending, waiting)
+        if not retryable:
+            break
+        if pass_num >= settings.max_retry_passes:
+            logger.warning(
+                "%d trip(s) still incomplete after %d retry pass(es); see %s",
+                len(retryable),
+                settings.max_retry_passes,
+                failure_log,
+            )
+            break
+        pass_num += 1
+        pending = retryable
+    return done
+
+
+def _report_holds_and_fail_if_unfinished(
+    db_path: Path,
+    in_scope: set[TripKey],
+    *,
+    total: int,
+    completed: int,
+    restore_tier: str,
+    failure_log: Path,
+) -> None:
+    """Report Deep-Archive holds; exit 1 when any other requested trip is unfinished."""
+    # Files in S3 Deep Archive can't be downloaded until their restore completes;
+    # tell the user when to re-run. Last thing on screen on purpose.
+    conn = connect(db_path)
+    restore_trips, restore_files, max_eta_ms = ledger.pending_restore_stats(
+        conn, in_scope
+    )
+    archived_trips, archived_files = ledger.archived_stats(conn, in_scope)
+    conn.close()
+    if restore_trips:
+        logger.warning(
+            _pending_restore_message(
+                restore_trips,
+                restore_files,
+                max_eta_ms,
+                restore_tier,
+            )
+        )
+    if archived_trips:
+        logger.warning(
+            "%d trip(s) skipped: %d file(s) are archived and not available for "
+            "download in this dataset. If you need these files, please contact "
+            "the NATIX team to have them included, then re-run the same command.",
+            archived_trips,
+            archived_files,
+        )
+
+    # A run that did not produce every requested trip must not look successful to
+    # whatever called it. Deep-Archive waits are the exception: a documented
+    # "re-run later", not a failure, and already reported above.
+    unfinished = total - completed - restore_trips - archived_trips
+    if unfinished > 0:
+        logger.error(
+            "%d of %d requested trip(s) were not completed; see %s",
+            unfinished,
+            total,
+            failure_log,
+        )
+        sys.exit(1)
+
+
 def main() -> None:
     run_stamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
     dataset_id = settings.dataset_id.strip()
@@ -1052,6 +1227,12 @@ def main() -> None:
     log_file = _setup_logging(run_stamp, dataset_id)
     failure_log = LOGS_DIR / f"{safe_name(dataset_id)}_failed_trips_{run_stamp}.log"
     logger.info("Full logs: %s", log_file)
+    logger.info(
+        "Run %s (dry_run=%s): videos %s",
+        RUN_ID,
+        settings.dry_mode,
+        "skipped, other files downloaded" if settings.dry_mode else "downloaded",
+    )
 
     output_dir: Path = settings.output_dir.resolve()
     if output_dir.exists() and not output_dir.is_dir():
@@ -1163,46 +1344,9 @@ def main() -> None:
     # Optional subset: process only the trips (and, per trip, optionally only the
     # minutes) listed in the JSON TRIPS_FILE. Minute names are resolved against
     # each trip's manifest inside process_trip.
-    minute_selection: dict[TripKey, frozenset[str]] = {}
-    if settings.trips_file.strip():
-        trips_path = Path(settings.trips_file).expanduser()
-        try:
-            selection = load_trips_selection(trips_path)
-        except FileNotFoundError:
-            logger.error("TRIPS_FILE not found: %s", trips_path)
-            sys.exit(1)
-        except ValueError as exc:
-            logger.error("TRIPS_FILE is invalid: %s", exc)
-            sys.exit(1)
-        requested: list[RequestedTripKey] = list(selection.keys())
-        minute_selection = {
-            key: minutes for key, minutes in selection.items() if minutes is not None
-        }
-        dataset_trip_count = len(all_trips)
-        missing = _unmatched_requested_trips(all_trips, requested)
-        if missing:
-            logger.warning(
-                "%d requested trip(s) are not in dataset %s and will be skipped: %s",
-                len(missing),
-                dataset_id,
-                ", ".join(format_trip_key(trip) for trip in missing),
-            )
-        all_trips = _filter_requested_trips(all_trips, requested)
-        if not all_trips:
-            logger.error(
-                "None of the %d requested trip(s) are in dataset %s; nothing to do.",
-                len(requested),
-                dataset_id,
-            )
-            return
-        logger.info(
-            "Trip filter active (%s): processing %d of %d dataset trip(s), "
-            "%d with a minute selection",
-            trips_path,
-            len(all_trips),
-            dataset_trip_count,
-            sum(1 for trip in all_trips if trip in minute_selection),
-        )
+    all_trips, minute_selection = _apply_trips_file(all_trips, dataset_id)
+    if not all_trips:
+        return
 
     total = len(all_trips)
     # Only trips in scope for this run count towards the tally — the ledger may hold
@@ -1289,52 +1433,25 @@ def main() -> None:
             time.monotonic() - phase_start,
         )
 
-    pass_num = 0
-    while pending:
-        label = "main pass" if pass_num == 0 else f"retry pass {pass_num}"
-        logger.info("Starting %s over %d trip(s)", label, len(pending))
-        _run_pass(
-            pending,
-            api_key=api_key,
-            dataset_id=dataset_id,
-            output_dir=output_dir,
-            cache_dir=cache_dir,
-            dataset_output=dataset_output,
-            present_keys=present_keys,
-            s3_target=s3_target,
-            minute_selection=minute_selection,
-            completed_segments=completed_segments,
-            total_trips=total,
-            worker_count=worker_count,
-            db_path=db_path,
-            failure_log=failure_log,
-            locking_required=locking_required,
-        )
-
-        conn = connect(db_path)
-        complete_keys = ledger.completed_trip_keys(conn)
-        done = complete_keys | ledger.segmented_trip_keys(conn)
-        completed_segments = frozenset(key for key in complete_keys if key.segment)
-        # Both hold-states are excluded from IN-RUN retries only: a restore takes
-        # hours, and an archived verdict only changes when the dataset is edited
-        # server-side — re-fetching seconds later helps neither. A future run of
-        # the same command re-enqueues both.
-        waiting = ledger.pending_restore_trip_keys(conn) | ledger.archived_trip_keys(conn)
-        conn.close()
-        pending = _filter_pending_trips(all_trips, done)
-        retryable = _filter_retryable_trips(pending, waiting)
-        if not retryable:
-            break
-        if pass_num >= settings.max_retry_passes:
-            logger.warning(
-                "%d trip(s) still incomplete after %d retry pass(es); see %s",
-                len(retryable),
-                settings.max_retry_passes,
-                failure_log,
-            )
-            break
-        pass_num += 1
-        pending = retryable
+    done = _run_passes(
+        pending,
+        all_trips,
+        done,
+        completed_segments,
+        db_path=db_path,
+        failure_log=failure_log,
+        api_key=api_key,
+        dataset_id=dataset_id,
+        output_dir=output_dir,
+        cache_dir=cache_dir,
+        dataset_output=dataset_output,
+        present_keys=present_keys,
+        s3_target=s3_target,
+        minute_selection=minute_selection,
+        total_trips=total,
+        worker_count=worker_count,
+        locking_required=locking_required,
+    )
 
     # Upload the saved request last (never before forking a worker that creates a
     # boto3 client — keeps the client per-worker and fork-safe).
@@ -1369,44 +1486,14 @@ def main() -> None:
             except Exception:
                 logger.exception("Failed to write the safety-critical events manifest")
 
-    # Files in S3 Deep Archive can't be downloaded until their restore completes;
-    # tell the user when to re-run. Last thing on screen on purpose.
-    conn = connect(db_path)
-    restore_trips, restore_files, max_eta_ms = ledger.pending_restore_stats(
-        conn, in_scope
+    _report_holds_and_fail_if_unfinished(
+        db_path,
+        in_scope,
+        total=total,
+        completed=completed,
+        restore_tier=dataset_request_model.settings.restore_tier,
+        failure_log=failure_log,
     )
-    archived_trips, archived_files = ledger.archived_stats(conn, in_scope)
-    conn.close()
-    if restore_trips:
-        logger.warning(
-            _pending_restore_message(
-                restore_trips,
-                restore_files,
-                max_eta_ms,
-                dataset_request_model.settings.restore_tier,
-            )
-        )
-    if archived_trips:
-        logger.warning(
-            "%d trip(s) skipped: %d file(s) are archived and not available for "
-            "download in this dataset. If you need these files, please contact "
-            "the NATIX team to have them included, then re-run the same command.",
-            archived_trips,
-            archived_files,
-        )
-
-    # A run that did not produce every requested trip must not look successful to
-    # whatever called it. Deep-Archive waits are the exception: a documented
-    # "re-run later", not a failure, and already reported above.
-    unfinished = total - completed - restore_trips - archived_trips
-    if unfinished > 0:
-        logger.error(
-            "%d of %d requested trip(s) were not completed; see %s",
-            unfinished,
-            total,
-            failure_log,
-        )
-        sys.exit(1)
 
     # Every requested trip is accounted for, but some of that is the resume
     # state's word alone: the listing that would have checked it failed at

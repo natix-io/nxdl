@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import contextlib
 import json
 import logging
 import sys
@@ -22,6 +23,7 @@ from app.validation import (
     validate_dataset,
 )
 from app.manifest_coverage import ManifestCoverageResult, collect_manifest_missing_files
+from app.manifest_export import ExportError, ManifestExport, open_export
 from schemas.camera_selection import CAMERA_SELECTION
 from utils.path_helpers import TripKey, resolve_camera_selection
 from utils.s3_dataset import (
@@ -114,27 +116,51 @@ def main() -> None:
 
     s3_context: S3ReportContext | None = None
     manifest_coverage: ManifestCoverageResult | None = None
-    if args.s3 is not None:
-        report, s3_context, manifest_coverage = _validate_on_s3(args.s3, args=args)
-    else:
-        allowed_root_files = (
-            frozenset({args.output.resolve()})
-            if args.output is not None
-            else frozenset()
-        )
-        report = validate_dataset(
-            dataset_dir=args.dataset_dir,
-            allowed_root_files=allowed_root_files,
-            camera_selection=camera_selection,
-            workers=args.workers,
-        )
-        manifest_coverage = _collect_manifest_coverage(
-            report,
-            trip_filter=None,
-            max_trips=args.manifest_max_trips or None,
-            uploaded_only=args.manifest_uploaded_only,
-        )
-    _print_report(report, s3_context, manifest_coverage)
+    manifest_source: str | None = None
+    try:
+        with contextlib.ExitStack() as stack:
+            export = (
+                stack.enter_context(
+                    open_export(
+                        args.manifests,
+                        api_key=settings.api_key.strip(),
+                        dataset_id=settings.dataset_id.strip(),
+                    )
+                )
+                if args.manifests
+                else None
+            )
+            if export is not None:
+                manifest_source = (
+                    f"export {export.dataset_id} at {export.exported_at}"
+                )
+            if args.s3 is not None:
+                report, s3_context, manifest_coverage = _validate_on_s3(
+                    args.s3, args=args, export=export
+                )
+            else:
+                allowed_root_files = (
+                    frozenset({args.output.resolve()})
+                    if args.output is not None
+                    else frozenset()
+                )
+                report = validate_dataset(
+                    dataset_dir=args.dataset_dir,
+                    allowed_root_files=allowed_root_files,
+                    camera_selection=camera_selection,
+                    workers=args.workers,
+                )
+                manifest_coverage = _collect_manifest_coverage(
+                    report,
+                    trip_filter=None,
+                    max_trips=args.manifest_max_trips or None,
+                    uploaded_only=args.manifest_uploaded_only,
+                    export=export,
+                )
+    except ExportError as exc:
+        print(f"Manifest export {args.manifests}: {exc}", file=sys.stderr)
+        sys.exit(2)
+    _print_report(report, s3_context, manifest_coverage, manifest_source)
 
     if args.output is not None:
         args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -144,6 +170,7 @@ def main() -> None:
                 verbose_trips=True,
                 s3_context=s3_context,
                 manifest_coverage=manifest_coverage,
+                manifest_source=manifest_source,
             ),
             encoding="utf-8",
         )
@@ -169,6 +196,7 @@ def _validate_on_s3(
     s3_arg: str,
     *,
     args: argparse.Namespace,
+    export: ManifestExport | None = None,
 ) -> tuple[ValidationReport, S3ReportContext, ManifestCoverageResult | None]:
     """Validate the dataset uploaded to S3 (read-only: LIST + GET only)."""
     uri = s3_arg or settings.s3_upload
@@ -275,6 +303,7 @@ def _validate_on_s3(
         trip_filter=context.expected_trips,
         max_trips=args.manifest_max_trips or None,
         uploaded_only=args.manifest_uploaded_only,
+        export=export,
     )
     return report, context, manifest_coverage
 
@@ -285,6 +314,7 @@ def _collect_manifest_coverage(
     trip_filter: set[TripKey] | None,
     max_trips: int | None,
     uploaded_only: bool,
+    export: ManifestExport | None = None,
 ) -> ManifestCoverageResult | None:
     if report.unusable:
         return None
@@ -300,6 +330,7 @@ def _collect_manifest_coverage(
         trip_filter=trip_filter,
         max_trips=max_trips,
         uploaded_only=uploaded_only,
+        manifests=export.manifests() if export is not None else None,
     )
 
 
@@ -363,6 +394,7 @@ def _print_report(
     report: ValidationReport,
     s3_context: S3ReportContext | None = None,
     manifest_coverage: ManifestCoverageResult | None = None,
+    manifest_source: str | None = None,
 ) -> None:
     print(
         _render_report(
@@ -370,6 +402,7 @@ def _print_report(
             verbose_trips=False,
             s3_context=s3_context,
             manifest_coverage=manifest_coverage,
+            manifest_source=manifest_source,
         ),
         end="",
     )
@@ -381,12 +414,15 @@ def _render_report(
     verbose_trips: bool,
     s3_context: S3ReportContext | None = None,
     manifest_coverage: ManifestCoverageResult | None = None,
+    manifest_source: str | None = None,
 ) -> str:
     buffer = StringIO()
     write = buffer.write
 
     write("Dataset QA report\n")
     write(f"Dataset path: {s3_context.uri if s3_context else report.dataset_dir}\n")
+    if manifest_source:
+        write(f"Manifest source: {manifest_source}\n")
     if s3_context is not None:
         if s3_context.request_note:
             write(f"Dataset request source: {s3_context.request_note}\n")
@@ -763,6 +799,16 @@ def _parse_args() -> argparse.Namespace:
             "Which cameras each minute is required to have. Omit to use "
             "CAMERA_SELECTION from the active .env (default 'all'). Pass the "
             "same value that was used for the download."
+        ),
+    )
+    parser.add_argument(
+        "--manifests",
+        default=None,
+        metavar="SOURCE",
+        help=(
+            "Check files against a manifest export instead of one API request per "
+            "trip: 'api', an s3:// URI, or a path to the export file. Nothing is "
+            "sampled in this mode (--manifest-max-trips is ignored)."
         ),
     )
     parser.add_argument(

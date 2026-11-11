@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -10,17 +11,16 @@ from app.trip_downloader import (
     get_trip_manifests,
 )
 from app.validation import _discover_trip_dirs, parse_trip_dir_name
+from nxdl_core.expected_files import (
+    build_expected_trip_files as _core_build_expected_trip_files,
+)
+from schemas.camera_selection import CAMERA_SELECTION
 from schemas.dataset_request import DatasetOutput, SavedDatasetRequest
 from schemas.trip_manifest import TripManifest
 from utils.path_helpers import (
     TripKey,
-    build_camera_directory_path,
-    build_camera_file_path,
-    build_camera_video_path,
-    build_fused_sei_path,
     build_minute_directory_path,
-    build_trip_insight_path,
-    is_camera_allowed,
+    resolve_camera_selection,
 )
 from utils.settings import settings
 from utils.trip_list import format_trip_key
@@ -57,90 +57,16 @@ def build_expected_trip_files(
     output: DatasetOutput,
     *,
     dry_mode: bool,
+    camera_selection: CAMERA_SELECTION | None = None,
 ) -> list[Path]:
-    """Return paths relative to the trip directory that a completed download should contain."""
-    expected: list[Path] = []
-    trip_root = Path(".")
-    timezone = trip_manifest.timezone
-    if timezone is None:
-        return expected
-
-    if output.fixed_metadata is not None:
-        if output.fixed_metadata.csv is not None:
-            expected.append(Path("fixed_metadata.csv"))
-        if output.fixed_metadata.json_format is not None:
-            expected.append(Path("fixed_metadata.json"))
-        if output.fixed_metadata.mcap is not None:
-            expected.extend(
-                [
-                    Path("fixed_metadata.mcap"),
-                    Path("minute_metadata.proto"),
-                    Path("trip_metadata.proto"),
-                ]
-            )
-
-    if output.trip_insight is not None and trip_manifest.base_insights is not None:
-        expected.append(build_trip_insight_path(trip_root).relative_to(trip_root))
-
-    for minute in trip_manifest.minutes:
-        if minute.minute_epoch is None:
-            continue
-
-        minute_dir = build_minute_directory_path(
-            trip_root, minute.minute_epoch, timezone
-        )
-
-        # A restoring/archived file has its link withheld but exists server-side —
-        # keep it expected so neither the S3 fast-resume nor QA can call the trip
-        # complete.
-        if output.footage.fused_sei is not None and (
-            minute.fused_sei is not None
-            or minute.fused_sei_status in ("restoring", "archived")
-        ):
-            expected.append(
-                build_fused_sei_path(
-                    minute_dir, minute.minute_epoch, timezone
-                ).relative_to(trip_root)
-            )
-
-        if output.minute.mapping_file:
-            expected.append((minute_dir / "mapping.txt").relative_to(trip_root))
-
-        for camera in minute.cameras:
-            if not is_camera_allowed(camera.camera_type):
-                continue
-            camera_type = camera.camera_type or "unknown"
-            camera_dir = build_camera_directory_path(minute_dir, camera_type)
-            video_path = build_camera_video_path(
-                camera_dir,
-                camera_type,
-                minute.minute_epoch,
-                timezone,
-            )
-            expected.append(video_path.relative_to(trip_root))
-
-            # Match the published telemetry outputs: MCAP is derived from the CSV,
-            # which the formatter removes when CSV output is disabled.
-            if (
-                trip_manifest.health_grade != 0
-                and camera.telemetry is not None
-            ):
-                telemetry_path = build_camera_file_path(
-                    camera_dir, camera.telemetry.presigned_url
-                ).relative_to(trip_root)
-                if output.footage.csv is not None:
-                    expected.append(telemetry_path)
-                if output.footage.mcap is not None:
-                    expected.append(telemetry_path.with_suffix(".mcap"))
-
-            if output.footage.sei is not None and (
-                camera.sei is not None or camera.sei_status in ("restoring", "archived")
-            ):
-                sei_path = video_path.with_suffix(".sei")
-                sei_path = sei_path.with_name(f"{sei_path.name}.csv")
-                expected.append(sei_path.relative_to(trip_root))
-
-    return _dedupe_paths(expected)
+    """``nxdl_core.expected_files.build_expected_trip_files``, where ``camera_selection``
+    None means the configured ``settings.camera_selection``."""
+    return _core_build_expected_trip_files(
+        trip_manifest,
+        output,
+        dry_mode=dry_mode,
+        camera_selection=resolve_camera_selection(camera_selection),
+    )
 
 
 def collect_manifest_missing_files(
@@ -150,6 +76,7 @@ def collect_manifest_missing_files(
     trip_filter: set[TripKey] | None = None,
     max_trips: int | None = None,
     uploaded_only: bool = False,
+    manifests: Iterable[TripManifest] | None = None,
 ) -> ManifestCoverageResult:
     """Compare on-disk/S3 content against trip manifests from the API.
 
@@ -166,6 +93,11 @@ def collect_manifest_missing_files(
     manifest is checked unit by unit: a segment with no folder is reported
     absent as ``<trip>_<LABEL>``, and a trip with no segment expects nothing.
     ``trip_filter`` may name whole trips or single segments.
+
+    ``manifests`` is a manifest export's stream: no trip-manifest request is made,
+    ``max_trips`` is ignored (every manifest is already in hand, so nothing is
+    sampled), the stream is consumed once and each candidate trip is checked as it
+    arrives and dropped. A candidate the stream never produced is a fetch error.
     """
     api_key = settings.api_key.strip()
     dataset_id = settings.dataset_id.strip()
@@ -245,7 +177,7 @@ def collect_manifest_missing_files(
 
     coverage_notes: list[str] = []
     sampled = present
-    if max_trips is not None and len(present) > max_trips:
+    if manifests is None and max_trips is not None and len(present) > max_trips:
         sampled = present[:max_trips]
         coverage_notes.append(
             f"manifest file coverage sampled: {len(sampled)} of {len(present)} "
@@ -262,44 +194,7 @@ def collect_manifest_missing_files(
         )
     trips_to_check = [*sampled, *absent]
 
-    # Manifest fetching is the whole cost of this check — one request per trip
-    # against a dataset that can hold ~180k of them. `get_trip_manifests` asks the
-    # service for 25 at a time where it supports that, and falls back to one
-    # request per trip where it does not. The remaining requests are still pure
-    # network I/O, so they are also spread over a thread pool.
-    keys = [TripKey(t.trip_id, t.sub_trip, t.health_grade) for t in trips_to_check]
-    workers = max(1, settings.manifest_fetch_workers)
-    batches = [
-        keys[i : i + MANIFEST_BATCH_SIZE]
-        for i in range(0, len(keys), MANIFEST_BATCH_SIZE)
-    ]
-
-    def _fetch_batch(batch):
-        return get_trip_manifests(api_key, dataset_id, batch)
-
-    manifests: dict = {}
-    errors: dict = {}
-    if workers > 1 and len(batches) > 1:
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            for got, failed in pool.map(_fetch_batch, batches):
-                manifests.update(got)
-                errors.update(failed)
-    else:
-        for batch in batches:
-            got, failed = _fetch_batch(batch)
-            manifests.update(got)
-            errors.update(failed)
-
-    for ds_trip in trips_to_check:
-        trip_key = TripKey(ds_trip.trip_id, ds_trip.sub_trip, ds_trip.health_grade)
-        trip_manifest = manifests.get(trip_key)
-
-        if trip_manifest is None:
-            fetch_errors.append(
-                f"{format_trip_key(trip_key)}: {errors.get(trip_key, 'no manifest returned')}"
-            )
-            continue
-
+    def check_trip(trip_key: TripKey, trip_manifest: TripManifest) -> None:
         selected_minutes = selection.get(trip_key) if selection is not None else None
         for unit_key, unit_manifest in segment_units(
             trip_key, trip_manifest, selected_minutes
@@ -330,7 +225,7 @@ def collect_manifest_missing_files(
             expected_files = build_expected_trip_files(
                 unit_manifest, output, dry_mode=dry_mode
             )
-            expected_minutes = _expected_minute_dirs(unit_manifest)
+            expected_minutes = expected_minute_dirs(unit_manifest)
             present_minutes = _present_minute_dirs(trip_dir)
             covered_minutes = present_minutes & expected_minutes
 
@@ -353,6 +248,63 @@ def collect_manifest_missing_files(
                     f"{trip_rel}: {len(covered_minutes)}/{len(expected_minutes)} minutes present, "
                     f"{len(trip_missing_files)} missing file(s)"
                 )
+
+    if manifests is not None:
+        wanted = {
+            TripKey(t.trip_id, t.sub_trip, t.health_grade) for t in trips_to_check
+        }
+        seen: set[TripKey] = set()
+        for trip_manifest in manifests:
+            trip_key = TripKey(
+                trip_manifest.trip_id, trip_manifest.sub_trip, trip_manifest.health_grade
+            )
+            if trip_key in wanted and trip_key not in seen:
+                seen.add(trip_key)
+                check_trip(trip_key, trip_manifest)
+        for ds_trip in trips_to_check:
+            trip_key = TripKey(ds_trip.trip_id, ds_trip.sub_trip, ds_trip.health_grade)
+            if trip_key not in seen:
+                fetch_errors.append(
+                    f"{format_trip_key(trip_key)}: not in the manifest export"
+                )
+    else:
+        # Manifest fetching is the whole cost of this check — one request per trip
+        # against a dataset that can hold ~180k of them. `get_trip_manifests` asks the
+        # service for 25 at a time where it supports that, and falls back to one
+        # request per trip where it does not. The remaining requests are still pure
+        # network I/O, so they are also spread over a thread pool.
+        keys = [TripKey(t.trip_id, t.sub_trip, t.health_grade) for t in trips_to_check]
+        workers = max(1, settings.manifest_fetch_workers)
+        batches = [
+            keys[i : i + MANIFEST_BATCH_SIZE]
+            for i in range(0, len(keys), MANIFEST_BATCH_SIZE)
+        ]
+
+        def _fetch_batch(batch):
+            return get_trip_manifests(api_key, dataset_id, batch)
+
+        fetched: dict = {}
+        errors: dict = {}
+        if workers > 1 and len(batches) > 1:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                for got, failed in pool.map(_fetch_batch, batches):
+                    fetched.update(got)
+                    errors.update(failed)
+        else:
+            for batch in batches:
+                got, failed = _fetch_batch(batch)
+                fetched.update(got)
+                errors.update(failed)
+
+        for ds_trip in trips_to_check:
+            trip_key = TripKey(ds_trip.trip_id, ds_trip.sub_trip, ds_trip.health_grade)
+            trip_manifest = fetched.get(trip_key)
+            if trip_manifest is None:
+                fetch_errors.append(
+                    f"{format_trip_key(trip_key)}: {errors.get(trip_key, 'no manifest returned')}"
+                )
+                continue
+            check_trip(trip_key, trip_manifest)
 
     note = "; ".join(coverage_notes) if coverage_notes else None
     if fetch_errors:
@@ -408,7 +360,7 @@ def _index_discovered_trips(dataset_dir: Path) -> dict[TripKey, Path]:
     return indexed
 
 
-def _expected_minute_dirs(trip_manifest: TripManifest) -> set[str]:
+def expected_minute_dirs(trip_manifest: TripManifest) -> set[str]:
     timezone = trip_manifest.timezone
     if timezone is None:
         return set()
@@ -436,18 +388,6 @@ def _present_minute_dirs(trip_dir: Path) -> set[str]:
 def _looks_like_minute_dir(name: str) -> bool:
     parts = name.split("-")
     return len(parts) == 3 and all(part.isdigit() and len(part) == 2 for part in parts)
-
-
-def _dedupe_paths(paths: list[Path]) -> list[Path]:
-    seen: set[str] = set()
-    deduped: list[Path] = []
-    for path in paths:
-        key = path.as_posix()
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append(path)
-    return deduped
 
 
 def _relative_path(dataset_dir: Path, path: Path) -> str:

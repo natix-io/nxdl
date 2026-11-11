@@ -1,10 +1,13 @@
-class UserExceptions(Exception):
-    pass
+"""Moved to ``nxdl_core.exceptions``; this path stays for the shipped client's imports."""
 
-class NotSupportedTripFormat(UserExceptions):
-    def __init__(self, format, file_type):
-        super().__init__(f"Trip file format {format} is not supported for generating {file_type}.")
+from nxdl_core.exceptions import (
+    NotSupportedFootageFormat,
+    NotSupportedTripFormat,
+    UserExceptions,
+)
 
-class NotSupportedFootageFormat(UserExceptions):
-    def __init__(self, format, file_type):
-        super().__init__(f"Footage file format {format} is not supported for generating {file_type}.")
+__all__ = [
+    "NotSupportedFootageFormat",
+    "NotSupportedTripFormat",
+    "UserExceptions",
+]

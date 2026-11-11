@@ -44,7 +44,7 @@ import re
 import sqlite3
 import threading
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from queue import Empty, Queue
@@ -161,6 +161,29 @@ class StatusEvent:
     state: str | None = None
     timezone: str | None = None
     manifest_generated_at: str | None = None
+    # Counters a caller attaches to a terminal trip event for its run summary.
+    # Not persisted: the ledger columns above are the whole of its schema.
+    stats: dict[str, int | str] | None = None
+
+
+@dataclass
+class StatsTotals:
+    """Running totals of the ``stats`` on trip events, kept by the ledger writer.
+
+    Numbers are summed; a string value goes into the set of distinct values seen
+    for its key. Owned by the caller, so one instance spans every pass of a run.
+    Events without ``stats`` (every download) add nothing.
+    """
+
+    sums: dict[str, int] = field(default_factory=dict)
+    values: dict[str, set[str]] = field(default_factory=dict)
+
+    def add(self, stats: Mapping[str, int | str]) -> None:
+        for key, value in stats.items():
+            if isinstance(value, str):
+                self.values.setdefault(key, set()).add(value)
+            else:
+                self.sums[key] = self.sums.get(key, 0) + value
 
 
 class Reporter:
@@ -1055,12 +1078,14 @@ class LedgerWriter(threading.Thread):
         total_trips: int,
         *,
         render_interval: float = 2.0,
+        stats_totals: StatsTotals | None = None,
     ) -> None:
         super().__init__(name="ledger-writer", daemon=True)
         self._conn = conn
         self._queue = queue
         self._total = total_trips
         self._render_interval = render_interval
+        self._stats_totals = stats_totals
         self._failure_log: Path | None = None
         self._last_render = 0.0
         self._dirty = 0
@@ -1135,6 +1160,8 @@ class LedgerWriter(threading.Thread):
             )
             if event.status in (TRIP_FAILED, TRIP_PARTIAL):
                 self._append_failure(event, now)
+            if event.stats and self._stats_totals is not None:
+                self._stats_totals.add(event.stats)
         else:
             self._conn.execute(
                 """
