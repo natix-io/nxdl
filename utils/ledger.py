@@ -44,7 +44,8 @@ import re
 import sqlite3
 import threading
 import time
-from collections.abc import Callable, Iterable, Mapping
+import uuid
+from collections.abc import Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from queue import Empty, Queue
@@ -119,6 +120,15 @@ CREATE TABLE IF NOT EXISTS files (
     PRIMARY KEY (trip_id, sub_trip, health_grade, segment, rel_path)
 );
 CREATE INDEX IF NOT EXISTS idx_trips_status ON trips(status);
+CREATE TABLE IF NOT EXISTS trip_bytes (
+    trip_id      TEXT NOT NULL,
+    sub_trip     INTEGER NOT NULL,
+    health_grade INTEGER NOT NULL,
+    segment      TEXT NOT NULL DEFAULT '',
+    files        INTEGER NOT NULL,
+    bytes        INTEGER NOT NULL,
+    PRIMARY KEY (trip_id, sub_trip, health_grade, segment)
+);
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -134,6 +144,7 @@ _META_DATASET_ID = "dataset_id"
 # check has run over them. A start-up killed in between must not come back to a
 # ledger that looks verified.
 _META_VERIFY_PENDING = "verify_pending"
+_META_DELIVERY_ID = "delivery_id"
 
 
 @dataclass(frozen=True)
@@ -220,6 +231,34 @@ class Reporter:
             )
         )
 
+    def size(
+        self,
+        trip_id: str,
+        sub_trip: int,
+        health_grade: int,
+        files: int,
+        size_bytes: int,
+        *,
+        segment: str = "",
+    ) -> None:
+        """What a trip's downloaded files add up to, once they are all on disk."""
+        self._queue.put(
+            StatusEvent(
+                "size",
+                trip_id,
+                sub_trip,
+                health_grade,
+                "",
+                segment=segment,
+                file_total=files,
+                size_bytes=size_bytes,
+            )
+        )
+
+    def stats(self, stats: Mapping[str, int | str]) -> None:
+        """Counters for the run summary only; nothing is written to the ledger."""
+        self._queue.put(StatusEvent("stats", "", 0, 0, "", stats=dict(stats)))
+
 
 # State lives OUTSIDE the dataset dir, so an output dir holds only dataset content.
 STATE_DIR = Path("state")
@@ -256,6 +295,46 @@ def stamp_output_dir(
         rows,
     )
     conn.commit()
+
+
+def delivery_id(conn: sqlite3.Connection) -> str:
+    """This ledger's id, made on first use: the same on every re-run of one delivery
+    (output dir + dataset), so the service can tell a re-run from a new delivery."""
+    conn.execute(
+        "INSERT OR IGNORE INTO meta (key, value) VALUES (?, ?)",
+        (_META_DELIVERY_ID, uuid.uuid4().hex),
+    )
+    conn.commit()
+    return conn.execute(
+        "SELECT value FROM meta WHERE key = ?", (_META_DELIVERY_ID,)
+    ).fetchone()[0]
+
+
+def downloaded_totals(
+    conn: sqlite3.Connection, in_scope: Collection[TripKey]
+) -> tuple[int, int, int]:
+    """``(files, bytes, trips sized)`` the in-scope trips hold: each trip once,
+    however often a failed attempt made the client fetch its files again.
+
+    Only trips the ledger still has a row for. Trips completed before sizes were
+    recorded, or restored from markers into a new ledger, have none: the third
+    number says how many trips the first two cover. A chopped trip's segments are
+    sized one by one and count as the one trip they are.
+    """
+    rows = conn.execute(
+        "SELECT b.trip_id, b.sub_trip, b.health_grade, b.files, b.bytes "
+        "FROM trip_bytes b JOIN trips t ON t.trip_id = b.trip_id AND t.sub_trip = b.sub_trip "
+        "AND t.health_grade = b.health_grade AND t.segment = b.segment"
+    )
+    files = size = 0
+    sized = set()
+    for trip_id, sub_trip, health_grade, n, nbytes in rows:
+        key = TripKey(trip_id, int(sub_trip), int(health_grade))
+        if key in in_scope:
+            files += n
+            size += nbytes
+            sized.add(key)
+    return files, size, len(sized)
 
 
 def ledger_dataset_id(db_path: Path) -> str | None:
@@ -701,6 +780,15 @@ def drop_completions(conn: sqlite3.Connection, keys: Iterable[TripKey]) -> int:
             "AND segment = ?",
             keys,
         )
+        try:
+            # Else a retry that fails brings the old size back with its new trip row.
+            conn.executemany(
+                "DELETE FROM trip_bytes WHERE trip_id = ? AND sub_trip = ? "
+                "AND health_grade = ? AND segment = ?",
+                keys,
+            )
+        except sqlite3.OperationalError:
+            pass  # a ledger from before sizes were recorded has no such table
         _delete_trip_rows(conn, keys)
         conn.commit()
     return len(keys)
@@ -1119,6 +1207,36 @@ class LedgerWriter(threading.Thread):
         self._queue.put(None)
 
     def _apply(self, event: StatusEvent) -> None:
+        if event.scope == "stats":
+            if event.stats and self._stats_totals is not None:
+                self._stats_totals.add(event.stats)
+            return
+        if event.scope == "size":
+            # Never added to: a trip fetched again after a failed attempt is still
+            # one trip's worth of files. The larger figure is kept, because a retry
+            # after formatting sizes files that formatting has already rewritten or
+            # removed. Written as trips go, so a killed run does not lose them.
+            # shortcut: a retry also sizes files an earlier attempt's formatting
+            # grew (embedded metadata, a few kB per video), so a trip can read
+            # slightly high; exact needs per-file sizes, add them if that matters.
+            self._conn.execute(
+                "INSERT INTO trip_bytes (trip_id, sub_trip, health_grade, segment, files, "
+                "bytes) VALUES (?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(trip_id, sub_trip, health_grade, segment) DO UPDATE SET "
+                "files = MAX(files, excluded.files), bytes = MAX(bytes, excluded.bytes)",
+                (
+                    event.trip_id,
+                    event.sub_trip,
+                    event.health_grade,
+                    event.segment,
+                    event.file_total or 0,
+                    event.size_bytes or 0,
+                ),
+            )
+            self._dirty += 1
+            if self._dirty >= 100:
+                self._flush()
+            return
         now = time.strftime("%Y-%m-%dT%H:%M:%S")
         if event.scope == "trip":
             self._conn.execute(

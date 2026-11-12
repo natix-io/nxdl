@@ -4,6 +4,7 @@ import os
 import shutil
 import socket
 import tempfile
+import threading
 import uuid
 from collections.abc import Callable, Collection
 from concurrent.futures import ThreadPoolExecutor
@@ -376,6 +377,21 @@ def _write_link_file(presigned_url: str, link_path: Path) -> None:
     os.replace(part, link_path)
 
 
+# What this process fetched since `take_fetched` last ran. A worker handles one trip
+# at a time, its file threads share the tally, and the worker loop drains it after
+# each trip into the run's totals (for the end-of-run report).
+_fetched = {"files_downloaded": 0, "bytes_downloaded": 0}
+_fetched_lock = threading.Lock()
+
+
+def take_fetched() -> dict[str, int]:
+    with _fetched_lock:
+        taken = dict(_fetched)
+        for key in _fetched:
+            _fetched[key] = 0
+    return taken
+
+
 def _run_task(task: _DownloadTask) -> None:
     # Skip a file already fully present locally (atomic rename means any existing
     # final file is complete) — makes a partial-trip retry re-fetch only what is
@@ -393,6 +409,10 @@ def _run_task(task: _DownloadTask) -> None:
         max_retries=settings.download_max_retries,
         base_delay_seconds=settings.download_retry_base_delay,
     )
+    size = task.dest.stat().st_size
+    with _fetched_lock:
+        _fetched["files_downloaded"] += 1
+        _fetched["bytes_downloaded"] += size
 
 
 # Cap how many per-item error strings we inline into a trip's summary message; the
@@ -1285,6 +1305,19 @@ def _deliver_unit(
             else:
                 still_failed.append((task, message))
         failures = still_failed
+
+        # What this trip has on disk now, whichever attempt fetched it — also when
+        # some files failed: the ones that arrived stay in the cache. Sized here,
+        # before formatting rewrites or removes files.
+        fetched = {t.dest for t in tasks if not t.is_link and t.dest.exists()}
+        reporter.size(
+            trip_id,
+            sub_trip,
+            health_grade,
+            len(fetched),
+            sum(dest.stat().st_size for dest in fetched),
+            segment=segment,
+        )
 
         if failures:
             _record_download_failures(

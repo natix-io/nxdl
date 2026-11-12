@@ -23,7 +23,9 @@ from app.trip_downloader import (
     get_ds_manifest,
     process_trip,
     recover_interrupted_publishes,
+    take_fetched,
 )
+from app.run_report import report_run
 from utils import ledger, markers
 from utils.ledger import LedgerWriter, Reporter, StatsTotals, connect
 from utils.path_helpers import (
@@ -1005,6 +1007,9 @@ def _worker_loop(
             minutes=(minute_selection or {}).get(task),
             completed_segments=completed_segments,
         )
+        fetched = take_fetched()
+        if fetched["files_downloaded"]:
+            reporter.stats(fetched)
 
 
 def _feed_queue(
@@ -1219,6 +1224,7 @@ def _report_holds_and_fail_if_unfinished(
 
 
 def main() -> None:
+    run_started = time.monotonic()
     run_stamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
     dataset_id = settings.dataset_id.strip()
     api_key = settings.api_key.strip()
@@ -1433,11 +1439,14 @@ def main() -> None:
             time.monotonic() - phase_start,
         )
 
+    # What the workers fetch this run, for the end-of-run report.
+    run_totals = StatsTotals()
     done = _run_passes(
         pending,
         all_trips,
         done,
         completed_segments,
+        stats_totals=run_totals,
         db_path=db_path,
         failure_log=failure_log,
         api_key=api_key,
@@ -1468,6 +1477,19 @@ def main() -> None:
     completed = len(done & in_scope)
     logger.info(
         "Finished dataset %s: %d/%d trip(s) complete", dataset_id, completed, total
+    )
+    report_run(
+        db_path,
+        api_key,
+        dataset_id=dataset_id,
+        in_scope=in_scope,
+        total=total,
+        completed=completed,
+        totals=run_totals,
+        started=run_started,
+        to_s3=s3_target is not None,
+        id_file=output_dir / ".natix" / "delivery" / _scope_digest(output_dir),
+        unverified=unverified,
     )
 
     if settings.create_manifest:
