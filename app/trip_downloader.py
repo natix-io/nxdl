@@ -955,6 +955,15 @@ def process_trip(
         )
 
     if trip_manifest.segments is None:
+        if minutes is not None:
+            # Recorded before delivery: the unit's terminal event is put inside
+            # deliver_unit, and the trip must never read as finished without them.
+            reporter.minutes(
+                trip_id,
+                sub_trip,
+                health_grade,
+                (minute.minute_id for minute in trip_manifest.minutes),
+            )
         deliver_unit(
             trip_key,
             trip_manifest,
@@ -1129,6 +1138,14 @@ def _deliver_segments(
 
     statuses = {label: status for label, (status, _restoring) in outcomes.items()}
     if all(status == TRIP_COMPLETE for status in statuses.values()):
+        # Every unit is delivered (by this run or an earlier one): their minutes
+        # are what the parent reports as delivered.
+        reporter.minutes(
+            trip_id,
+            sub_trip,
+            health_grade,
+            (minute.minute_id for _key, unit in units for minute in unit.minutes),
+        )
         reporter.trip(
             trip_id,
             sub_trip,

@@ -129,6 +129,20 @@ CREATE TABLE IF NOT EXISTS trip_bytes (
     bytes        INTEGER NOT NULL,
     PRIMARY KEY (trip_id, sub_trip, health_grade, segment)
 );
+CREATE TABLE IF NOT EXISTS reported_trips (
+    trip_id      TEXT NOT NULL,
+    sub_trip     INTEGER NOT NULL,
+    health_grade INTEGER NOT NULL,
+    reported_at  TEXT NOT NULL,
+    PRIMARY KEY (trip_id, sub_trip, health_grade)
+);
+CREATE TABLE IF NOT EXISTS delivered_minutes (
+    trip_id      TEXT NOT NULL,
+    sub_trip     INTEGER NOT NULL,
+    health_grade INTEGER NOT NULL,
+    minute_id    INTEGER NOT NULL,
+    PRIMARY KEY (trip_id, sub_trip, health_grade, minute_id)
+);
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -145,6 +159,75 @@ _META_DATASET_ID = "dataset_id"
 # ledger that looks verified.
 _META_VERIFY_PENDING = "verify_pending"
 _META_DELIVERY_ID = "delivery_id"
+# Set when delivered reporting arrives on a ledger that already holds finished
+# trips: rows finished at or before it are never reported (see
+# `unreported_delivered_keys`).
+_META_REPORT_CUTOFF = "delivered_report_cutoff"
+
+
+def unreported_delivered_keys(
+    conn: sqlite3.Connection, limit: int, exclude: Collection[TripKey] = ()
+) -> list[TripKey]:
+    """Whole trips that finished (complete or segmented) and were not yet reported
+    to the server as delivered. Segment rows never count on their own.
+
+    A trip that delivered nothing is never returned: a ``complete`` row with no
+    files, or a ``segmented`` parent with no delivered minutes (a chopped trip
+    without any segment). Reporting one would tag files nobody downloaded.
+
+    Deliberately never returned either, fail-safe, because nothing records what
+    they delivered: rows rebuilt from completion markers (``file_total = 0``) and
+    rows a pre-upgrade client finished (``updated_at`` at or before the ledger's
+    report cutoff). Reporting them with null minutes could tag a whole trip of
+    which only some minutes were delivered.
+
+    ``exclude`` pages past keys the caller already tried in this pass.
+    """
+    rows = conn.execute(
+        "SELECT t.trip_id, t.sub_trip, t.health_grade FROM trips t "
+        "WHERE t.segment = '' AND t.file_total > 0 AND (t.status = ? OR ("
+        "t.status = ? AND EXISTS (SELECT 1 FROM delivered_minutes m "
+        "WHERE m.trip_id = t.trip_id AND m.sub_trip = t.sub_trip "
+        "AND m.health_grade = t.health_grade))) "
+        "AND t.updated_at > COALESCE((SELECT value FROM meta WHERE key = ?), '') "
+        "AND NOT EXISTS ("
+        "SELECT 1 FROM reported_trips r WHERE r.trip_id = t.trip_id "
+        "AND r.sub_trip = t.sub_trip AND r.health_grade = t.health_grade) "
+        "ORDER BY t.updated_at, t.trip_id, t.sub_trip, t.health_grade LIMIT ?",
+        (TRIP_COMPLETE, TRIP_SEGMENTED, _META_REPORT_CUTOFF, limit + len(exclude)),
+    ).fetchall()
+    keys = [TripKey(row[0], int(row[1]), int(row[2]), "") for row in rows]
+    return [key for key in keys if key not in exclude][:limit]
+
+
+def delivered_minutes(
+    conn: sqlite3.Connection, keys: Iterable[TripKey]
+) -> dict[TripKey, list[int]]:
+    """The minutes (manifest ``minute_id``) delivered of each narrowed trip in
+    ``keys``, sorted. A trip absent from the result was delivered whole."""
+    found: dict[TripKey, list[int]] = {}
+    for key in keys:
+        minute_ids = [
+            int(row[0])
+            for row in conn.execute(
+                "SELECT minute_id FROM delivered_minutes WHERE trip_id = ? "
+                "AND sub_trip = ? AND health_grade = ? ORDER BY minute_id",
+                (key.trip_id, key.sub_trip, key.health_grade),
+            )
+        ]
+        if minute_ids:
+            found[key] = minute_ids
+    return found
+
+
+def mark_reported(conn: sqlite3.Connection, keys: Iterable[TripKey]) -> None:
+    now = time.strftime("%Y-%m-%dT%H:%M:%S")
+    conn.executemany(
+        "INSERT OR REPLACE INTO reported_trips "
+        "(trip_id, sub_trip, health_grade, reported_at) VALUES (?, ?, ?, ?)",
+        [(k.trip_id, k.sub_trip, k.health_grade, now) for k in keys],
+    )
+    conn.commit()
 
 
 @dataclass(frozen=True)
@@ -175,6 +258,8 @@ class StatusEvent:
     # Counters a caller attaches to a terminal trip event for its run summary.
     # Not persisted: the ledger columns above are the whole of its schema.
     stats: dict[str, int | str] | None = None
+    # scope "minutes": the minute_ids a narrowed trip delivers (delivered_minutes).
+    minute_ids: tuple[int, ...] | None = None
 
 
 @dataclass
@@ -252,6 +337,23 @@ class Reporter:
                 segment=segment,
                 file_total=files,
                 size_bytes=size_bytes,
+            )
+        )
+
+    def minutes(
+        self, trip_id: str, sub_trip: int, health_grade: int, minute_ids: Iterable[int]
+    ) -> None:
+        """The minutes a narrowed trip (chopped, or a TRIPS_FILE minute selection)
+        delivers, replacing any set recorded before. Put before the trip's terminal
+        event, so a reader never sees the trip finished without them."""
+        self._queue.put(
+            StatusEvent(
+                "minutes",
+                trip_id,
+                sub_trip,
+                health_grade,
+                "",
+                minute_ids=tuple(sorted(set(minute_ids))),
             )
         )
 
@@ -611,10 +713,37 @@ def connect(db_path: Path) -> sqlite3.Connection:
     conn.execute("PRAGMA synchronous=NORMAL")
     _reset_if_legacy_schema(conn, db_path)
     _migrate_v2_to_v3(conn, db_path)
+    upgrading = _has_table(conn, "trips") and not _has_table(conn, "delivered_minutes")
     conn.executescript(_SCHEMA)
+    if upgrading:
+        _stamp_report_cutoff(conn)
     conn.execute(f"PRAGMA user_version={_SCHEMA_VERSION}")
     conn.commit()
     return conn
+
+
+def _has_table(conn: sqlite3.Connection, name: str) -> bool:
+    return (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?", (name,)
+        ).fetchone()
+        is not None
+    )
+
+
+def _stamp_report_cutoff(conn: sqlite3.Connection) -> None:
+    """A ledger written before delivered reporting existed: its finished trips may
+    have been narrowed by a minute selection nobody recorded, so they must never be
+    reported (null minutes would tag the whole trip). Stamped once, only when it
+    holds finished trips; a fresh ledger gets no cutoff."""
+    if conn.execute(
+        "SELECT 1 FROM trips WHERE segment = '' AND status IN (?, ?) LIMIT 1",
+        (TRIP_COMPLETE, TRIP_SEGMENTED),
+    ).fetchone():
+        conn.execute(
+            "INSERT OR IGNORE INTO meta (key, value) VALUES (?, ?)",
+            (_META_REPORT_CUTOFF, time.strftime("%Y-%m-%dT%H:%M:%S")),
+        )
 
 
 def _migrate_v2_to_v3(conn: sqlite3.Connection, db_path: Path) -> None:
@@ -1077,10 +1206,11 @@ def pending_restore_trip_keys(conn: sqlite3.Connection) -> set[TripKey]:
 
 
 def archived_trip_keys(conn: sqlite3.Connection) -> set[TripKey]:
-    """Keys held back by archived (restore-not-requested) files.
+    """Keys held back by archived files (restore not requested, or not yet approved).
 
-    Excluded from IN-RUN retry passes only: the verdict changes when the dataset
-    is edited server-side (request_restore flipped to true), never within a run.
+    Excluded from IN-RUN retry passes only: the verdict changes server-side (the
+    dataset gets request_restore=true, or NATIX approves and runs the restore),
+    never within a run.
     The trips are NOT complete, so a future run of the same command re-enqueues
     them and re-fetches their manifests.
     """
@@ -1103,8 +1233,8 @@ def pending_restore_message(files: int, available_at_ms: int | None) -> str:
 def archived_message(files: int) -> str:
     """The trip-row ``error_message`` for an archived trip."""
     return (
-        f"{files} file(s) in Deep Archive; restore not requested for this dataset "
-        "(settings.request_restore=false)"
+        f"{files} file(s) in Deep Archive and not downloadable yet: restore not "
+        "requested for this dataset, or a restore is waiting for NATIX approval"
     )
 
 
@@ -1236,6 +1366,23 @@ class LedgerWriter(threading.Thread):
             self._dirty += 1
             if self._dirty >= 100:
                 self._flush()
+            return
+        if event.scope == "minutes":
+            # Replaced, not merged: a stale set left by an earlier attempt can only
+            # under-tag (report fewer minutes than delivered), never over-tag.
+            key = (event.trip_id, event.sub_trip, event.health_grade)
+            self._conn.execute(
+                "DELETE FROM delivered_minutes WHERE trip_id = ? AND sub_trip = ? "
+                "AND health_grade = ?",
+                key,
+            )
+            self._conn.executemany(
+                "INSERT OR IGNORE INTO delivered_minutes "
+                "(trip_id, sub_trip, health_grade, minute_id) VALUES (?, ?, ?, ?)",
+                [(*key, minute_id) for minute_id in event.minute_ids or ()],
+            )
+            # Not flushed here: the trip's terminal event follows and commits both.
+            self._dirty += 1
             return
         now = time.strftime("%Y-%m-%dT%H:%M:%S")
         if event.scope == "trip":

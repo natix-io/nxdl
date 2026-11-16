@@ -17,6 +17,7 @@ from queue import Empty, Full
 from schemas import DatasetOutput
 from schemas.dataset_request import DatasetRequest, SEIDataOptions
 from app.event_manifest import write_event_manifest
+from app.delivered_report import FINAL_FLUSH_BUDGET_S, DeliveredReporter, flush as flush_delivered
 from app.trip_downloader import (
     RUN_ID,
     get_dataset_request,
@@ -1107,6 +1108,13 @@ def _run_pass(
     )
     writer.attach_failure_log(failure_log)
     writer.start()
+    reporter = (
+        None
+        if settings.dry_mode
+        else DeliveredReporter(db_path, api_key, dataset_id)
+    )
+    if reporter is not None:
+        reporter.start()
 
     # Feed last: the queue is bounded, so the workers must already be draining it.
     _feed_queue(task_queue, trips, workers)
@@ -1116,6 +1124,9 @@ def _run_pass(
 
     writer.stop()
     writer.join()
+    if reporter is not None:
+        reporter.stop()
+        reporter.join()
     conn.close()
 
 
@@ -1478,6 +1489,8 @@ def main() -> None:
     logger.info(
         "Finished dataset %s: %d/%d trip(s) complete", dataset_id, completed, total
     )
+    # Also covers trips completed by resume reconciliation, which no pass touches.
+    flush_delivered(db_path, api_key, dataset_id, FINAL_FLUSH_BUDGET_S)
     report_run(
         db_path,
         api_key,

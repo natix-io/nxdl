@@ -42,7 +42,7 @@ class ManifestCoverageResult:
     missing_files: list[str] = field(default_factory=list)
     missing_minutes: list[str] = field(default_factory=list)
     # Trips in the dataset manifest that are entirely absent on disk/S3, split by
-    # why: archived (Deep Archive, restore not requested — will never download),
+    # why: archived (Deep Archive, restore not requested or awaiting approval),
     # restoring (Deep Archive restore in flight — a later run completes them),
     # or genuinely missing (the manifest offers everything, yet nothing landed).
     missing_trips: list[str] = field(default_factory=list)
